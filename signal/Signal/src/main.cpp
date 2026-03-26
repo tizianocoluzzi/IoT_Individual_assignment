@@ -1,10 +1,10 @@
 #include <Arduino.h>
 #include <math.h>
-
+#include "driver/i2s.h"
 // GPIO25 is DAC1 on ESP32 boards.
-constexpr uint8_t DAC_PIN = 25;
-constexpr float SAMPLE_RATE_HZ = 1000.0f;
-
+#define DAC_PIN 25
+#define SAMPLE_RATE_HZ 44100
+#define I2S_NUM I2S_NUM_0
 struct HarmonicComponent {
   float amplitude;
   float frequencyHz;
@@ -39,19 +39,37 @@ void analogSignalTask(void *pvParameters) {
   const float maxAmplitude = computeMaxAmplitude();
 
   while (true) {
-    const float tSeconds = sampleIndex * samplePeriod;
-    const float signal = computeSignal(tSeconds);
-    const float normalized = ((signal / maxAmplitude) + 1.0f) * 0.5f;
-    const uint8_t value = static_cast<uint8_t>(normalized * 255.0f);
-    dacWrite(DAC_PIN, value);
+    float tSeconds = sampleIndex * samplePeriod;
+    float signal = computeSignal(tSeconds);
+    float normalized = ((signal / maxAmplitude) + 1.0f) * 0.5f;
+    uint16_t value = static_cast<uint16_t>(normalized * 255.0f);
+    value <<= 8;
+    i2s_write(I2S_NUM, &value, sizeof(value), nullptr, portMAX_DELAY);
 
     sampleIndex++;
+    if(sampleIndex >= SAMPLE_RATE_HZ) {
+      sampleIndex = 0; // Wrap around after 1 second of audio.
+    }
 
-    vTaskDelay(pdMS_TO_TICKS(1));
+    //vTaskDelay(pdMS_TO_TICKS(1));
   }
 }
 
 void setup() {
+  i2s_config_t i2s_config = {
+      .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_DAC_BUILT_IN),
+      .sample_rate = SAMPLE_RATE_HZ,
+      .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+      .channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT,
+      .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+      .intr_alloc_flags = 0,
+      .dma_buf_count = 8,
+      .dma_buf_len = 64,
+      .use_apll = false};
+
+  i2s_driver_install(I2S_NUM, &i2s_config, 0, NULL);
+  i2s_set_dac_mode(I2S_DAC_CHANNEL_BOTH_EN); // Enables GPIO25 and 26
+  
   xTaskCreatePinnedToCore(
       analogSignalTask,
       "AnalogSignalTask",
