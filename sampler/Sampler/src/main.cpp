@@ -1,13 +1,15 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <arduinoFFT.h>
+#include "driver/i2s.h"
 
 #define SAMPLES 1024
 #define FREQ 1000
 
-double vReal[SAMPLES];
+double vReal1[SAMPLES];
+double vReal2[SAMPLES];
 double vImag[SAMPLES];
-ArduinoFFT<double> FFT = ArduinoFFT<double>(vReal, vImag, SAMPLES, FREQ);
+ArduinoFFT<double> FFT = ArduinoFFT<double>(vReal1, vImag, SAMPLES, FREQ);
 
 // FreeRTOS task handle
 TaskHandle_t adcTaskHandle = NULL;
@@ -25,25 +27,33 @@ volatile uint16_t latestAdcSample = 0;
 void fftTask(void* pvParameters) {
   // Arduino Serial Plotter works best with stable labels on every line.
   //Serial.println("adc\tpeak");
-
+    double* vReal = vReal2;
     for(;;) {
       ulTaskNotifyTake(pdTRUE, portMAX_DELAY); // Wait until notified by ADC task
+      if(vReal == vReal1) {
+        vReal = vReal2;
+      } else {
+        vReal = vReal1;
+      }
       FFT.windowing(vReal, SAMPLES, FFT_WIN_TYP_HAMMING, FFT_FORWARD);
       FFT.compute(vReal, vImag, SAMPLES, FFT_FORWARD);
       FFT.complexToMagnitude(vReal, vImag, SAMPLES);
-
       const double peakHz = FFT.majorPeak();
 
       int max_freq = 0;
-      for(int i = 0; i < SAMPLES / 2; i++) {
+      double mean = 0;
+      for(int i = 1; i < SAMPLES / 2; i++) { //from the first bin to remove the DC
         const double frequency = (i * FREQ) / SAMPLES;
         const double magnitude = vReal[i];
+        mean += magnitude;
         //Serial.printf("%f\t%f\r\n", frequency, magnitude);
-        if (magnitude > 3000){
+        if (magnitude > 60000){
           max_freq = frequency;
         }
       }
+      mean /= SAMPLES / 2;
       Serial.println("max_freq: " + String(max_freq));
+      Serial.println("mean: " + String(mean));
 
       //we do not want to have the frequence with the highest magnitude but the highest frequence in the spectrum that is above a certain threshold.
       Serial.printf("FFT-major-peak: %f HZ\r\n", peakHz);
@@ -58,14 +68,19 @@ void adcReadTask(void* pvParameters) {
   pinMode(analogPin, INPUT);
   analogReadResolution(12);
   analogSetPinAttenuation(analogPin, ADC_11db);
-
+  double* vReal = vReal2;
   for(;;) {
+    if(vReal == vReal1) {
+      vReal = vReal2;
+    } else {
+      vReal = vReal1;
+    }
     for (int i = 0; i < SAMPLES; i++) {
       latestAdcSample = analogRead(analogPin);
       vReal[i] = latestAdcSample;
       vImag[i] = 0; // Imaginary part is zero for real signals
       
-      //Serial.printf(">adc:%u,\r\n", latestAdcSample);
+      Serial.printf(">adc:%u,\r\n", latestAdcSample);
     }
     xTaskNotifyGive(fftTaskHandle); // Notify FFT task that new data is ready
     vTaskDelay(pdMS_TO_TICKS(10));
