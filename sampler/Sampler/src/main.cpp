@@ -2,28 +2,45 @@
 #include <Wire.h>
 #include <arduinoFFT.h>
 #include "driver/i2s.h"
+#include "WiFi.h"
+#include <WiFiUdp.h>
 
-#define SAMPLES 2048
 #define SAMPLES 4096
 #define FREQ 1000
 #define WINDOWSIZE 32 //sie of the window
+
+#ifndef WIFI_SSID
+#define WIFI_SSID "TIM-19969363"
+#endif 
+#ifndef WIFI_PASSWORD
+#define WIFI_PASSWORD "OVG48h8ENz23z8CJqeJPLTte"
+#endif
+
+#define SERVER_IP "192.168.1.41"
+
+#define PORT 8081
 
 double vReal1[SAMPLES];
 double vReal2[SAMPLES];
 double vImag1[SAMPLES];
 double vImag2[SAMPLES];
 double window[WINDOWSIZE];
+
 ArduinoFFT<double> FFT = ArduinoFFT<double>(vReal1, vImag1, SAMPLES, FREQ);
 
 // FreeRTOS task handle
 TaskHandle_t adcTaskHandle = NULL;
 TaskHandle_t fftTaskHandle = NULL;
 TaskHandle_t windowTaskHandle = NULL;
+TaskHandle_t wifiTaskHandle = NULL;
+static QueueHandle_t data_queue;
 static QueueHandle_t fft_queue;
 static QueueHandle_t window_task;
 // Heltec WiFi LoRa 32 V3 uses ESP32-S3.
 // GPIO1 is ADC-capable on ESP32-S3 and is a practical default analog input.
 const int analogPin = 2;
+
+WiFiUDP udp;
 
 volatile uint16_t latestAdcSample = 0;
 
@@ -33,6 +50,36 @@ typedef struct vectors{
   double mean;
 } vectors;
 
+void initWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    vTaskDelay(pdMS_TO_TICKS(500));
+    Serial.print(".");
+  }
+
+  Serial.println("\nWiFi connected");
+  Serial.println(WiFi.localIP());
+
+  udp.begin(PORT);
+}
+void wifiTask(void* pvParameters) {
+  uint16_t data;
+
+  for (;;) {
+    if (xQueueReceive(data_queue, &data, portMAX_DELAY)) {
+
+      char buffer[64];
+      snprintf(buffer, sizeof(buffer),
+               "res:%d\n", data);
+
+      udp.beginPacket(SERVER_IP, PORT);
+      udp.write((uint8_t*)buffer, strlen(buffer));
+      udp.endPacket();
+    }
+  }
+}
 void computeWindowTask(void* pvParameters){
   TickType_t start;
   uint16_t mean = 0;
@@ -47,6 +94,7 @@ void computeWindowTask(void* pvParameters){
     {
       mean/=cnt;
       Serial.printf("computed mean: %d\n", mean);
+      xQueueSend(data_queue, &mean, 0);
       //TODO send trough wi-fi and LoRa
       cnt = 0;
       mean = 0;
@@ -54,6 +102,7 @@ void computeWindowTask(void* pvParameters){
   }
 
 }
+
 void fftTask(void* pvParameters) {
   // Arduino Serial Plotter works best with stable labels on every line.
   //Serial.println("adc\tpeak");
@@ -149,6 +198,8 @@ void setup() {
   delay(300);
   fft_queue = xQueueCreate(2, sizeof(vectors));
   window_task = xQueueCreate(10, sizeof(latestAdcSample));
+  data_queue = xQueueCreate(10, sizeof(uint16_t)); //clearly oversized
+  initWiFi();
   // Create the ADC read task on core 0 with low priority.
   xTaskCreatePinnedToCore(
     adcReadTask,
@@ -170,7 +221,6 @@ void setup() {
   xTaskCreatePinnedToCore(
     fftTask,
     "FFT Task",
-    4096,
     8192,
     NULL,
     1,
@@ -195,6 +245,21 @@ void setup() {
   );
   if(windowTaskHandle == NULL){
     Serial.println("Failed to create window task");
+    while(true){
+      vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+  }
+  xTaskCreatePinnedToCore(
+    wifiTask,
+    "wifi task",
+    2048,
+    NULL,
+    1,
+    &wifiTaskHandle,
+    1
+  );
+  if(wifiTaskHandle == NULL){
+    Serial.println("Failed to create wifi task");
     while(true){
       vTaskDelay(pdMS_TO_TICKS(1000));
     }
