@@ -4,18 +4,23 @@
 #include "driver/i2s.h"
 
 #define SAMPLES 2048
+#define SAMPLES 4096
 #define FREQ 1000
+#define WINDOWSIZE 32 //sie of the window
 
 double vReal1[SAMPLES];
 double vReal2[SAMPLES];
 double vImag1[SAMPLES];
 double vImag2[SAMPLES];
+double window[WINDOWSIZE];
 ArduinoFFT<double> FFT = ArduinoFFT<double>(vReal1, vImag1, SAMPLES, FREQ);
 
 // FreeRTOS task handle
 TaskHandle_t adcTaskHandle = NULL;
 TaskHandle_t fftTaskHandle = NULL;
+TaskHandle_t windowTaskHandle = NULL;
 static QueueHandle_t fft_queue;
+static QueueHandle_t window_task;
 // Heltec WiFi LoRa 32 V3 uses ESP32-S3.
 // GPIO1 is ADC-capable on ESP32-S3 and is a practical default analog input.
 const int analogPin = 2;
@@ -28,7 +33,27 @@ typedef struct vectors{
   double mean;
 } vectors;
 
+void computeWindowTask(void* pvParameters){
+  TickType_t start;
+  uint16_t mean = 0;
+  int cnt = 0;
+  uint16_t sample;
+  for(;;){
+    
+    xQueueReceive(window_task, (void *)&sample, pdMS_TO_TICKS(portMAX_DELAY));
+    cnt++;
+    mean += sample;
+    if (cnt == WINDOWSIZE)
+    {
+      mean/=cnt;
+      Serial.printf("computed mean: %d\n", mean);
+      //TODO send trough wi-fi and LoRa
+      cnt = 0;
+      mean = 0;
+    }    
+  }
 
+}
 void fftTask(void* pvParameters) {
   // Arduino Serial Plotter works best with stable labels on every line.
   //Serial.println("adc\tpeak");
@@ -105,9 +130,11 @@ void adcReadTask(void* pvParameters) {
       vImag[i] = 0; // Imaginary part is zero for real signals
       mean += latestAdcSample;
       int64_t end = esp_timer_get_time();
+      xQueueSend(window_task,(void*) &latestAdcSample, pdMS_TO_TICKS(10));
       //Serial.printf(">exec_time:%d\r\n", end-start);
       //Serial.printf(">adc:%u\r\n", latestAdcSample);
-      vTaskDelayUntil(&st,pdMS_TO_TICKS(1));
+      BaseType_t ret =  xTaskDelayUntil(&st,pdMS_TO_TICKS(1));
+      if(ret == pdFALSE) Serial.println("[ADC] error, could not make it");
     }
     vec.vReal = vReal;
     vec.vImag = vImag; 
@@ -121,6 +148,7 @@ void setup() {
   Serial.begin(115200);
   delay(300);
   fft_queue = xQueueCreate(2, sizeof(vectors));
+  window_task = xQueueCreate(10, sizeof(latestAdcSample));
   // Create the ADC read task on core 0 with low priority.
   xTaskCreatePinnedToCore(
     adcReadTask,
@@ -143,6 +171,7 @@ void setup() {
     fftTask,
     "FFT Task",
     4096,
+    8192,
     NULL,
     1,
     &fftTaskHandle,
@@ -155,6 +184,21 @@ void setup() {
     }
   }
 
+  xTaskCreatePinnedToCore(
+    computeWindowTask,
+    "window task",
+    2048,
+    NULL,
+    1,
+    &windowTaskHandle,
+    1
+  );
+  if(windowTaskHandle == NULL){
+    Serial.println("Failed to create window task");
+    while(true){
+      vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+  }
   Serial.println("ADC read FreeRTOS task started");
 }
 
@@ -162,21 +206,3 @@ void loop() {
   // No periodic action needed here; all work is in adcReadTask
   vTaskDelay(pdMS_TO_TICKS(1000));
 }
-/*
-#include <Arduino.h>
-
-const int analogPin = 2;
-
-void setup() {
-  Serial.begin(115200);
-  delay(300);
-  pinMode(analogPin, INPUT);
-  analogReadResolution(12);
-  analogSetPinAttenuation(analogPin, ADC_11db);
-}
-
-void loop() {
-  uint16_t sample = analogRead(analogPin);
-  Serial.printf(">adc:%u\r\n", sample);
-  delayMicroseconds(2000); // 500 Hz sample rate
-}*/
