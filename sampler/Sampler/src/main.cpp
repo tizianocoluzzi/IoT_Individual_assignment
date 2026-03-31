@@ -10,10 +10,10 @@
 #define WINDOWSIZE 32 //sie of the window
 
 #ifndef WIFI_SSID
-#define WIFI_SSID "TIM-19969363"
+#error "No wifi SSID inserted"
 #endif 
 #ifndef WIFI_PASSWORD
-#define WIFI_PASSWORD "OVG48h8ENz23z8CJqeJPLTte"
+#error "No wifi Passrowd inserted"
 #endif
 
 #define SERVER_IP "192.168.1.41"
