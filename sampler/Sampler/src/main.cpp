@@ -19,6 +19,10 @@
 #define SERVER_IP "192.168.1.41"
 
 #define PORT 8081
+#define LORA_FREQUENCY 866.3
+#define LORA_BANDWIDTH 125.0
+#define LORA_SPREADING_FACTOR 9
+#define LORA_TX_POWER 10
 
 double vReal1[SAMPLES];
 double vReal2[SAMPLES];
@@ -33,7 +37,9 @@ TaskHandle_t adcTaskHandle = NULL;
 TaskHandle_t fftTaskHandle = NULL;
 TaskHandle_t windowTaskHandle = NULL;
 TaskHandle_t wifiTaskHandle = NULL;
-static QueueHandle_t data_queue;
+TaskHandle_t loraTaskHandle = NULL;
+static QueueHandle_t wifi_data_queue;
+static QueueHandle_t lora_data_queue;
 static QueueHandle_t fft_queue;
 static QueueHandle_t window_task;
 // Heltec WiFi LoRa 32 V3 uses ESP32-S3.
@@ -64,22 +70,59 @@ void initWiFi() {
 
   udp.begin(PORT);
 }
+void initLoRa() {
+  heltec_setup();
+  Serial.println("LoRa radio init");
+
+  int16_t state = radio.begin();
+  if (state != RADIOLIB_ERR_NONE) {
+    Serial.printf("LoRa begin failed: %d\n", state);
+    return;
+  }
+
+  state = radio.setFrequency(LORA_FREQUENCY);
+  if (state != RADIOLIB_ERR_NONE) {
+    Serial.printf("LoRa setFrequency failed: %d\n", state);
+  }
+
+  state = radio.setBandwidth(LORA_BANDWIDTH);
+  if (state != RADIOLIB_ERR_NONE) {
+    Serial.printf("LoRa setBandwidth failed: %d\n", state);
+  }
+
+  state = radio.setSpreadingFactor(LORA_SPREADING_FACTOR);
+  if (state != RADIOLIB_ERR_NONE) {
+    Serial.printf("LoRa setSpreadingFactor failed: %d\n", state);
+  }
+
+  state = radio.setOutputPower(LORA_TX_POWER);
+  if (state != RADIOLIB_ERR_NONE) {
+    Serial.printf("LoRa setOutputPower failed: %d\n", state);
+  }
+}
+
 void wifiTask(void* pvParameters) {
   uint16_t data;
 
   for (;;) {
     if (xQueueReceive(data_queue, &data, portMAX_DELAY)) {
 
-      char buffer[64];
-      snprintf(buffer, sizeof(buffer),
-               "res:%d\n", data);
+void loraTask(void* pvParameters) {
+  uint16_t data;
 
-      udp.beginPacket(SERVER_IP, PORT);
-      udp.write((uint8_t*)buffer, strlen(buffer));
-      udp.endPacket();
+  for (;;) {
+    if (xQueueReceive(lora_data_queue, &data, portMAX_DELAY)) {
+      char buffer[64];
+      snprintf(buffer, sizeof(buffer), "res:%d", data);
+
+      int16_t state = radio.transmit(buffer);
+      if (state != RADIOLIB_ERR_NONE) {
+        Serial.printf("LoRa TX failed: %d\n", state);
+      }
     }
   }
 }
+
 void computeWindowTask(void* pvParameters){
   TickType_t start;
   uint16_t mean = 0;
@@ -94,8 +137,8 @@ void computeWindowTask(void* pvParameters){
     {
       mean/=cnt;
       Serial.printf("computed mean: %d\n", mean);
-      xQueueSend(data_queue, &mean, 0);
-      //TODO send trough wi-fi and LoRa
+      xQueueSend(wifi_data_queue, &mean, 0);
+      xQueueSend(lora_data_queue, &mean, 0);
       cnt = 0;
       mean = 0;
     }    
@@ -198,8 +241,10 @@ void setup() {
   delay(300);
   fft_queue = xQueueCreate(2, sizeof(vectors));
   window_task = xQueueCreate(10, sizeof(latestAdcSample));
-  data_queue = xQueueCreate(10, sizeof(uint16_t)); //clearly oversized
+  wifi_data_queue = xQueueCreate(10, sizeof(uint16_t)); //clearly oversized
+  lora_data_queue = xQueueCreate(10, sizeof(uint16_t)); //clearly oversized
   initWiFi();
+  initLoRa();
   // Create the ADC read task on core 0 with low priority.
   xTaskCreatePinnedToCore(
     adcReadTask,
@@ -264,6 +309,23 @@ void setup() {
       vTaskDelay(pdMS_TO_TICKS(1000));
     }
   }
+
+  xTaskCreatePinnedToCore(
+    loraTask,
+    "lora task",
+    4096,
+    NULL,
+    1,
+    &loraTaskHandle,
+    1
+  );
+  if(loraTaskHandle == NULL){
+    Serial.println("Failed to create lora task");
+    while(true){
+      vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+  }
+
   Serial.println("ADC read FreeRTOS task started");
 }
 

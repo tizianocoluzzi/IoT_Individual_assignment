@@ -31,3 +31,6 @@ This is useless because we need just the max frequency. I've seen that sometimes
 
 #### Window and WiFi
 I implemented a simple mean calculator over a sample based thumbling window and sent the result via wifi. I chose a thumbling window because it is more intresting for the quantity of data when the sample rate decreases. I also tried to increase the total sample to increase precision a stress the treshold methob but it resisted. 
+
+#### LoRa 
+I implemented the Lora usage
