@@ -2,8 +2,11 @@
 #include <Wire.h>
 #include <arduinoFFT.h>
 #include "driver/i2s.h"
-#include "WiFi.h"
+#include <WiFi.h>
 #include <WiFiUdp.h>
+#include "secret.h"
+#include <heltec_unofficial.h>
+#include <PubSubClient.h>
 
 #define SAMPLES 4096
 #define FREQ 1000
@@ -19,6 +22,8 @@
 #define SERVER_IP "192.168.1.41"
 
 #define PORT 8081
+#define MQTT_BUFFER_SIZE 256
+
 #define LORA_FREQUENCY 866.3
 #define LORA_BANDWIDTH 125.0
 #define LORA_SPREADING_FACTOR 9
@@ -46,7 +51,8 @@ static QueueHandle_t window_task;
 // GPIO1 is ADC-capable on ESP32-S3 and is a practical default analog input.
 const int analogPin = 2;
 
-WiFiUDP udp;
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
 
 volatile uint16_t latestAdcSample = 0;
 
@@ -56,8 +62,61 @@ typedef struct vectors{
   double mean;
 } vectors;
 
+
+void mqtt_reconnect()
+{
+    while (!mqttClient.connected())
+    {
+        Serial.print("Connecting to MQTT...");
+
+        if (mqttClient.connect("esp32_client"))
+        {
+            Serial.println("connected");
+        }
+        else
+        {
+            Serial.print("failed, rc=");
+            Serial.print(mqttClient.state());
+            Serial.println(" retrying...");
+            vTaskDelay(pdMS_TO_TICKS(2000));
+        }
+    }
+}
+
+void mqttTask(void *pvParameters)
+{
+  mqttClient.setServer(SERVER_IP, PORT);
+
+  const char *topic = "tzn/data";
+  uint16_t data;
+  char payload[MQTT_BUFFER_SIZE];
+  for (;;)
+  {
+    if (!mqttClient.connected())
+    {
+      mqtt_reconnect();
+    }
+
+    mqttClient.loop();
+
+    if (xQueueReceive(wifi_data_queue, &data, pdMS_TO_TICKS(100)) == pdTRUE)
+    {
+      Serial.println("received data");
+      /* Append one sample to CSV */
+      unsigned long timestamp_ms = millis();
+      int written = snprintf(
+          payload,
+          MQTT_BUFFER_SIZE,
+          "%lu,%.2f\n",
+          timestamp_ms, data);
+      mqttClient.publish(topic, payload);
+      Serial.println("sent data");
+    }
+  }
+}
+
 void initWiFi() {
-  WiFi.mode(WIFI_STA);
+  //WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   while (WiFi.status() != WL_CONNECTED) {
@@ -68,8 +127,8 @@ void initWiFi() {
   Serial.println("\nWiFi connected");
   Serial.println(WiFi.localIP());
 
-  udp.begin(PORT);
 }
+
 void initLoRa() {
   heltec_setup();
   Serial.println("LoRa radio init");
@@ -101,11 +160,7 @@ void initLoRa() {
   }
 }
 
-void wifiTask(void* pvParameters) {
-  uint16_t data;
 
-  for (;;) {
-    if (xQueueReceive(data_queue, &data, portMAX_DELAY)) {
 
 void loraTask(void* pvParameters) {
   uint16_t data;
@@ -295,9 +350,9 @@ void setup() {
     }
   }
   xTaskCreatePinnedToCore(
-    wifiTask,
-    "wifi task",
-    2048,
+    mqttTask,
+    "MQTT task",
+    8192,
     NULL,
     1,
     &wifiTaskHandle,
