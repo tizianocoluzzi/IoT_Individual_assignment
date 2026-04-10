@@ -1,8 +1,12 @@
-import socket
-
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.bind(("0.0.0.0", 8081))
-
-while True:
-    data, addr = sock.recvfrom(1024)
-    print(data.decode())
+import paho.mqtt.client as mqtt
+def on_connect(client, userdata, flags, rc):
+    print("Connected with result code "+str(rc))
+def on_message(client, userdata, msg):
+    print(msg.topic+" "+str(msg.payload))
+if __name__ == "__main__":
+    client = mqtt.Client()
+    client.on_connect = on_connect
+    client.on_message = on_message
+    client.connect("localhost", 1883, 60)
+    client.subscribe("sampler/data")
+    client.loop_forever()
