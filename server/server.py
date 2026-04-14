@@ -8,7 +8,7 @@ import paho.mqtt.client as mqtt
 BROKER = "broker.hivemq.com"
 PORT = 1883
 SUB_TOPIC = "tzn/data"
-PUB_TOPIC = "tzn/res"
+PUB_TOPIC = "tzn/time"
 CLIENT_ID = "delay_reflector"
 
 # =========================
@@ -18,6 +18,8 @@ last_counter = None
 total_received = 0
 total_missing = 0
 
+def now_us():
+    return int(time.monotonic_ns() // 1000)  # microseconds
 # =========================
 # CALLBACKS
 # =========================
@@ -30,7 +32,7 @@ def on_connect(client, userdata, flags, rc):
 
 def on_message(client, userdata, msg):
     global last_counter, total_received, total_missing
-
+    t2 = now_us();
     try:
         payload = json.loads(msg.payload.decode())
     except Exception as e:
@@ -64,9 +66,14 @@ def on_message(client, userdata, msg):
     # ECHO BACK (LOOPBACK)
     # =========================
     # Add reflector timestamp for RTT measurement
-    payload["reflected_timestamp"] = time.time()
+    response = {
+            "cnt": counter,
+            "t1": payload["t1"],
+            "t2": t2,
+            "t3": now_us()
+    }
 
-    client.publish(PUB_TOPIC, json.dumps(payload))
+    client.publish(PUB_TOPIC, json.dumps(response))
 
     # =========================
     # DEBUG OUTPUT
@@ -77,7 +84,10 @@ def on_message(client, userdata, msg):
         f"Received: {counter} | "
         f"Total recv: {total_received} | "
         f"Missing: {total_missing} | "
-        f"Loss rate: {loss_rate:.4f}"
+        f"Loss rate: {loss_rate:.4f} |"
+        f"id: {payload["cnt"]} |"
+        f"mean: {payload["mean"]} |"
+        f"exec_time {payload["window_exec_us"]}|"
     )
 
 # =========================
