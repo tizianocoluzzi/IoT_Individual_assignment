@@ -4,6 +4,7 @@
 #include "esp_system.h"
 #include <Wire.h>
 #include <Adafruit_INA219.h>
+//#define NO_NOISE
 #ifndef NO_NOISE
 #include <random>
 #endif
@@ -120,7 +121,7 @@ void analogSignalTask(void *pvParameters) {
 void ina219ReadTask(void *pvParameters) {
   (void)pvParameters;
   vTaskDelay(pdMS_TO_TICKS(500)); // wait for Wire to be ready
-  if (!ina219.begin(&Wire)) {
+  if (!ina219.begin()) {
     Serial.println("INA219 not found. Check wiring and I2C address.");
     scanI2CBus();
     vTaskDelete(nullptr);
