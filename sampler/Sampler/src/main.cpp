@@ -10,7 +10,8 @@
 #include <PubSubClient.h>
 
 #define SAMPLES 4096
-#define FREQ 1000
+#define FREQ 500
+#define BUTTON_PIN 0
 #define WINDOWSIZE 64 //sie of the window
 #define FILTER_HISTORY_SIZE 15
 #define HAMPEL_THRESHOLD 3.0
@@ -70,13 +71,39 @@ const int analogPin = 2;
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 
+const char *topic = "tzn/data";
+const char *time_topic = "tzn/time";
+
 volatile uint16_t latestAdcSample = 0;
+
+constexpr uint32_t BASE_SAMPLING_INTERVAL_MS =
+  (FREQ > 0) ? static_cast<uint32_t>((1000UL + (FREQ / 2)) / FREQ) : 1UL;
 
 typedef struct vectors{
   double* vReal;
   double* vImag;
   double mean;
+  double samplingFreq;
 } vectors;
+
+typedef struct telemetry_packet {
+  uint16_t mean;
+  uint32_t windowExecUs;
+} telemetry_packet;
+
+typedef struct {
+    uint32_t id;
+    int64_t t1;
+    int64_t t2;
+    int64_t t3;
+} response_t;
+
+volatile uint32_t gAdaptiveSamplingIntervalMs = BASE_SAMPLING_INTERVAL_MS;
+volatile bool gAdaptiveSamplingEnabled = false;
+
+void IRAM_ATTR onButtonPress() {
+  gAdaptiveSamplingEnabled = true;
+}
 
 double computeMedian(double* values, int size) {
   for (int i = 1; i < size; i++) {
@@ -179,6 +206,9 @@ void mqtt_reconnect()
         if (mqttClient.connect("esp32_client"))
         {
             Serial.println("connected");
+            if (!mqttClient.subscribe(time_topic)) {
+              Serial.println("failed to subscribe to time topic");
+            }
         }
         else
         {
@@ -189,13 +219,50 @@ void mqtt_reconnect()
         }
     }
 }
+void handle_response(char* topic, byte* payload, unsigned int length) {
+    payload[length] = '\0';
 
+    response_t resp;
+
+    Serial.printf("%s\n", (char*) payload);
+    // Simple parsing (use cJSON in production)
+    char *p = (char *)payload;
+    resp.id = 0;
+    resp.t1 = resp.t2 = resp.t3 = 0;
+
+    p = strstr(p, "\"cnt\":");
+    if (p)
+      resp.id = atoi(p + 6);
+    p = strstr(p, "\"t1\":");
+    if (p)
+      resp.t1 = strtoll(p + 5, NULL, 10);
+    p = strstr(p, "\"t2\":");
+    if (p)
+      resp.t2 = strtoll(p + 5, NULL, 10);
+    p = strstr(p, "\"t3\":");
+    if (p)
+      resp.t3 = strtoll(p + 5, NULL, 10);
+
+    Serial.printf("%lld, %lld, %lld\n", resp.t1, resp.t2, resp.t3);
+    int64_t t4 = esp_timer_get_time();
+
+    // Compute offset and latency
+    double offset = ((resp.t2 - resp.t1) + (resp.t3 - t4)) / 2.0;
+    double latency = ((t4 - resp.t1) - (resp.t3 - resp.t2)) / 2.0;
+
+    Serial.printf("ID: %u\n", resp.id);
+    Serial.printf("Offset: %.2f us\n", offset);
+    Serial.printf("Latency: %.2f us\n", latency);
+}
+
+void callback(char* topic, byte* payload, unsigned int length) {
+    if (strcmp(topic, time_topic) == 0) {
+        handle_response(topic, payload, length);
+    }
+}
 void mqttTask(void *pvParameters)
 {
-  mqttClient.setServer(SERVER_IP, PORT);
-
-  const char *topic = "tzn/data";
-  uint16_t data;
+  telemetry_packet packet;
   uint32_t cnt = 0;
   char payload[MQTT_BUFFER_SIZE];
   for (;;)
@@ -204,25 +271,26 @@ void mqttTask(void *pvParameters)
     {
       mqtt_reconnect();
     }
-
+    
     mqttClient.loop();
 
-    if (xQueueReceive(wifi_data_queue, &data, pdMS_TO_TICKS(100)) == pdTRUE)
+    if (xQueueReceive(wifi_data_queue, &packet, pdMS_TO_TICKS(100)) == pdTRUE)
     {
-      Serial.println("received data");
-      unsigned long timestamp_ms = millis();
+      //Serial.println("received data");
+      unsigned long timestamp_ms = esp_timer_get_time();
       int written = snprintf(
           payload,
           MQTT_BUFFER_SIZE,
-          "{\"cnt\":%lu,\"ts\":%lu,\"mean\":%u}",
+          "{\"cnt\":%lu,\"t1\":%lu,\"mean\":%u,\"window_exec_us\":%lu}",
           (unsigned long)cnt++,
           timestamp_ms,
-          (unsigned int)data);
+          (unsigned int)packet.mean,
+          (unsigned long)packet.windowExecUs);
 
       if (written > 0 && written < MQTT_BUFFER_SIZE)
       {
         mqttClient.publish(topic, payload);
-        Serial.println("sent data");
+        //Serial.println("sent data");
       }
       else
       {
@@ -274,14 +342,14 @@ void initLoRaWAN() {
 
 
 void loraTask(void* pvParameters) {
-  uint16_t data = 0;
-  uint16_t latestData = 0;
+  telemetry_packet packet = {0, 0};
+  telemetry_packet latestPacket = {0, 0};
   bool hasData = false;
   TickType_t lastUplink = xTaskGetTickCount();
 
   for (;;) {
-    if (xQueueReceive(lora_data_queue, &data, pdMS_TO_TICKS(1000)) == pdTRUE) {
-      latestData = data;
+    if (xQueueReceive(lora_data_queue, &packet, pdMS_TO_TICKS(1000)) == pdTRUE) {
+      latestPacket = packet;
       hasData = true;
     }
 
@@ -290,9 +358,13 @@ void loraTask(void* pvParameters) {
       continue;
     }
 
-    uint8_t payload[2];
-    payload[0] = highByte(latestData);
-    payload[1] = lowByte(latestData);
+    uint8_t payload[6];
+    payload[0] = highByte(latestPacket.mean);
+    payload[1] = lowByte(latestPacket.mean);
+    payload[2] = static_cast<uint8_t>((latestPacket.windowExecUs >> 24) & 0xFF);
+    payload[3] = static_cast<uint8_t>((latestPacket.windowExecUs >> 16) & 0xFF);
+    payload[4] = static_cast<uint8_t>((latestPacket.windowExecUs >> 8) & 0xFF);
+    payload[5] = static_cast<uint8_t>(latestPacket.windowExecUs & 0xFF);
 
     int16_t state = ttnNode.sendReceive(payload, sizeof(payload), TTN_UPLINK_FPORT);
     if (state < RADIOLIB_ERR_NONE) {
@@ -308,21 +380,26 @@ void loraTask(void* pvParameters) {
 }
 
 void computeWindowTask(void* pvParameters){
-  TickType_t start;
-  uint16_t mean = 0;
+  uint32_t mean = 0;
   int cnt = 0;
   uint16_t sample;
+  uint32_t windowStartUs = 0;
+  telemetry_packet packet;
   for(;;){
     
     xQueueReceive(window_task, (void *)&sample, pdMS_TO_TICKS(portMAX_DELAY));
+    if (cnt == 0) {
+      windowStartUs = micros();
+    }
     cnt++;
     mean += sample;
     if (cnt == WINDOWSIZE)
     {
-      mean/=cnt;
-      Serial.printf("computed mean: %d\n", mean);
-      xQueueSend(wifi_data_queue, &mean, 0);
-      xQueueSend(lora_data_queue, &mean, 0);
+      packet.mean = static_cast<uint16_t>(mean / cnt);
+      packet.windowExecUs = micros() - windowStartUs;
+      Serial.printf("computed mean: %u window_exec_us: %lu\n", packet.mean, (unsigned long)packet.windowExecUs);
+      xQueueSend(wifi_data_queue, &packet, 0);
+      xQueueSend(lora_data_queue, &packet, 0);
       cnt = 0;
       mean = 0;
     }    
@@ -332,6 +409,7 @@ void computeWindowTask(void* pvParameters){
 
 void filterTask(void* pvParameters) {
   uint16_t sample = 0;
+  telemetry_packet packet;
   double history[FILTER_HISTORY_SIZE] = {0.0};
   int historyCount = 0;
   int head = 0;
@@ -366,8 +444,10 @@ void filterTask(void* pvParameters) {
       continue;
     }
 
-    xQueueSend(wifi_data_queue, &sample, 0);
-    xQueueSend(lora_data_queue, &sample, 0);
+    packet.mean = sample;
+    packet.windowExecUs = 0;
+    xQueueSend(wifi_data_queue, &packet, 0);
+    xQueueSend(lora_data_queue, &packet, 0);
   }
 }
 
@@ -383,6 +463,7 @@ void fftTask(void* pvParameters) {
       xQueueReceive(fft_queue, (void*)&vec, portMAX_DELAY);  
       vReal = vec.vReal;
       vImag = vec.vImag;
+      const double samplingFreq = vec.samplingFreq;
       for(int i = 0; i < SAMPLES; i++){
         vReal[i]-= vec.mean;
       }
@@ -390,22 +471,22 @@ void fftTask(void* pvParameters) {
       FFT.windowing(vReal, SAMPLES, FFT_WIN_TYP_HAMMING, FFT_FORWARD);
       FFT.compute(vReal, vImag, SAMPLES, FFT_FORWARD);
       FFT.complexToMagnitude(vReal, vImag, SAMPLES);
-      const double peakHz = FFT.majorPeak(vReal, SAMPLES, FREQ);
+      const double peakHz = FFT.majorPeak(vReal, SAMPLES, samplingFreq);
 
       double mean = 0.0f;
       for(int i = 1; i < SAMPLES / 2; i++) { //from the first bin to remove the DC
-        const double frequency = (i * FREQ) / SAMPLES;
+        const double frequency = (i * samplingFreq) / SAMPLES;
         const double magnitude = vReal[i];
         mean += magnitude;
         //Serial.printf("%f ", magnitude); //use with fft_plotter.py
       }
       Serial.println();
       mean /= (SAMPLES / 2);
-      double threshold = mean * (5*SAMPLES/FREQ); //threshold is related to precision
+      double threshold = mean * (5*SAMPLES/samplingFreq); //threshold is related to precision
       double highest_freq = 0.0f;
       for (int i  = 1; i < SAMPLES / 2; i++){
         if(vReal[i] > threshold && (vReal[i] > vReal[i-1] || i == 1) && (vReal[i] >vReal[i+1] || i == SAMPLES/2)){
-          const double peakFrequency = (static_cast<double>(i) * static_cast<double>(FREQ)) / static_cast<double>(SAMPLES);
+          const double peakFrequency = (static_cast<double>(i) * samplingFreq) / static_cast<double>(SAMPLES);
           Serial.printf("peak identified: %.2f\n", peakFrequency);
           highest_freq = peakFrequency;
         } 
@@ -414,6 +495,14 @@ void fftTask(void* pvParameters) {
       float interval = 0;
       if(sampling_freq != 0){ interval = 1000/sampling_freq;} 
       Serial.printf("highest_freq: %lfHz, suggested sampling frequency: %dHz, time interval is: %f\n",highest_freq, sampling_freq, interval);
+
+      if (gAdaptiveSamplingEnabled && sampling_freq > 0) {
+        uint32_t newIntervalMs = static_cast<uint32_t>(round(1000.0 / static_cast<double>(sampling_freq)));
+        if (newIntervalMs == 0) {
+          newIntervalMs = 1;
+        }
+        gAdaptiveSamplingIntervalMs = newIntervalMs;
+      }
       //Serial.println("mean: " + String(mean));
 
       //we do not want to have the frequence with the highest magnitude but the highest frequence in the spectrum that is above a certain threshold.
@@ -440,19 +529,27 @@ void adcReadTask(void* pvParameters) {
       vImag = vImag1;
     }
     double mean = 0;
+    const uint32_t frameIntervalMs = gAdaptiveSamplingEnabled ? gAdaptiveSamplingIntervalMs : BASE_SAMPLING_INTERVAL_MS;
+    const double frameSamplingFreq = 1000.0 / static_cast<double>(frameIntervalMs);
     for (int i = 0; i < SAMPLES; i++) {
       TickType_t st = xTaskGetTickCount();
       latestAdcSample = analogRead(analogPin);
       vReal[i] = latestAdcSample;
       vImag[i] = 0; // Imaginary part is zero for real signals
-      xQueueSend(window_task,(void*) &latestAdcSample, pdMS_TO_TICKS(10));
+      xQueueSend(window_task,(void*) &latestAdcSample, 0);
       //Serial.printf(">exec_time:%d\r\n", end-start);
       //Serial.printf(">adc:%u\r\n", latestAdcSample);
-      BaseType_t ret =  xTaskDelayUntil(&st,pdMS_TO_TICKS(1));
-      if(ret == pdFALSE) Serial.println("[ADC] error, could not make it");
+      //TODO check if correct
+      int sleep_time_us = frameIntervalMs - (int) (xTaskGetTickCount() - st) *1000;  
+      esp_sleep_enable_timer_wakeup(sleep_time_us); // microseconds
+      esp_light_sleep_start();
+      //BaseType_t ret =  xTaskDelayUntil(&st,pdMS_TO_TICKS(frameIntervalMs));
+      //if(ret == pdFALSE) Serial.println("[ADC] error, could not make it");
     }
     vec.vReal = vReal;
     vec.vImag = vImag; 
+    vec.mean = mean;
+    vec.samplingFreq = frameSamplingFreq;
     xQueueSend(fft_queue, (void*)&vec, 0);
     //xTaskNotifyGive(fftTaskHandle); // Notify FFT task that new data is ready
   }
@@ -461,12 +558,16 @@ void adcReadTask(void* pvParameters) {
 void setup() {
   Serial.begin(115200);
   delay(300);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), onButtonPress, FALLING);
   fft_queue = xQueueCreate(2, sizeof(vectors));
   window_task = xQueueCreate(10, sizeof(latestAdcSample));
   filter_data_queue = xQueueCreate(10, sizeof(uint16_t));
-  wifi_data_queue = xQueueCreate(10, sizeof(uint16_t)); //clearly oversized
-  lora_data_queue = xQueueCreate(10, sizeof(uint16_t)); //clearly oversized
+  wifi_data_queue = xQueueCreate(10, sizeof(telemetry_packet)); 
+  lora_data_queue = xQueueCreate(10, sizeof(telemetry_packet)); 
   initWiFi();
+  mqttClient.setServer(SERVER_IP, PORT);
+  mqttClient.setCallback(callback);
   initLoRaWAN();
   // Create the ADC read task on core 0 with low priority.
   xTaskCreatePinnedToCore(
@@ -474,7 +575,7 @@ void setup() {
     "ADC Read Task",
     4096,
     NULL,
-    1,
+    2,
     &adcTaskHandle,
     0
   );
@@ -491,7 +592,7 @@ void setup() {
     "FFT Task",
     8192,
     NULL,
-    1,
+    2,
     &fftTaskHandle,
     1
   );
@@ -517,7 +618,7 @@ void setup() {
       vTaskDelay(pdMS_TO_TICKS(1000));
     }
   }
-
+/*
   xTaskCreatePinnedToCore(
     filterTask,
     "filter task",
@@ -533,7 +634,7 @@ void setup() {
       vTaskDelay(pdMS_TO_TICKS(1000));
     }
   }
-
+*/
   xTaskCreatePinnedToCore(
     mqttTask,
     "MQTT task",
