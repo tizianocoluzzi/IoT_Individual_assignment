@@ -6,6 +6,7 @@
 #include <WiFiUdp.h>
 #include "secret.h"
 #include <heltec_unofficial.h>
+#include <RadioLib.h>
 #include <PubSubClient.h>
 
 #define SAMPLES 4096
@@ -28,6 +29,8 @@
 #define LORA_BANDWIDTH 125.0
 #define LORA_SPREADING_FACTOR 9
 #define LORA_TX_POWER 10
+#define TTN_UPLINK_INTERVAL_SECONDS 60
+#define TTN_UPLINK_FPORT 1
 
 double vReal1[SAMPLES];
 double vReal2[SAMPLES];
@@ -47,6 +50,17 @@ static QueueHandle_t wifi_data_queue;
 static QueueHandle_t lora_data_queue;
 static QueueHandle_t fft_queue;
 static QueueHandle_t window_task;
+const LoRaWANBand_t ttnRegion = EU868;
+const uint8_t ttnSubBand = 0;
+LoRaWANNode ttnNode(&radio, &ttnRegion, ttnSubBand);
+
+uint8_t ttnAppKey[] = {TTN_APP_KEY};
+#ifdef TTN_NWK_KEY
+uint8_t ttnNwkKey[] = {TTN_NWK_KEY};
+const uint8_t* ttnNwkKeyPtr = ttnNwkKey;
+#else
+const uint8_t* ttnNwkKeyPtr = NULL;
+#endif
 // Heltec WiFi LoRa 32 V3 uses ESP32-S3.
 // GPIO1 is ADC-capable on ESP32-S3 and is a practical default analog input.
 const int analogPin = 2;
@@ -130,51 +144,64 @@ void initWiFi() {
 }
 
 void initLoRa() {
+void initLoRaWAN() {
   heltec_setup();
-  Serial.println("LoRa radio init");
+  Serial.println("LoRaWAN radio init");
 
   int16_t state = radio.begin();
   if (state != RADIOLIB_ERR_NONE) {
-    Serial.printf("LoRa begin failed: %d\n", state);
+    Serial.printf("LoRa radio begin failed: %d\n", state);
     return;
   }
 
-  state = radio.setFrequency(LORA_FREQUENCY);
+  state = ttnNode.beginOTAA(TTN_JOIN_EUI, TTN_DEV_EUI, ttnNwkKeyPtr, ttnAppKey);
   if (state != RADIOLIB_ERR_NONE) {
-    Serial.printf("LoRa setFrequency failed: %d\n", state);
+    Serial.printf("LoRaWAN OTAA init failed: %d\n", state);
+    return;
   }
 
-  state = radio.setBandwidth(LORA_BANDWIDTH);
-  if (state != RADIOLIB_ERR_NONE) {
-    Serial.printf("LoRa setBandwidth failed: %d\n", state);
-  }
-
-  state = radio.setSpreadingFactor(LORA_SPREADING_FACTOR);
-  if (state != RADIOLIB_ERR_NONE) {
-    Serial.printf("LoRa setSpreadingFactor failed: %d\n", state);
-  }
-
-  state = radio.setOutputPower(LORA_TX_POWER);
-  if (state != RADIOLIB_ERR_NONE) {
-    Serial.printf("LoRa setOutputPower failed: %d\n", state);
+  Serial.println("Joining TTN via OTAA...");
+  state = ttnNode.activateOTAA();
+  if (state == RADIOLIB_LORAWAN_NEW_SESSION || state == RADIOLIB_LORAWAN_SESSION_RESTORED) {
+    Serial.println("TTN join successful");
+  } else {
+    Serial.printf("TTN join failed: %d\n", state);
   }
 }
 
 
 
 void loraTask(void* pvParameters) {
-  uint16_t data;
+  uint16_t data = 0;
+  uint16_t latestData = 0;
+  bool hasData = false;
+  TickType_t lastUplink = xTaskGetTickCount();
 
   for (;;) {
-    if (xQueueReceive(lora_data_queue, &data, portMAX_DELAY)) {
-      char buffer[64];
-      snprintf(buffer, sizeof(buffer), "res:%d", data);
-
-      int16_t state = radio.transmit(buffer);
-      if (state != RADIOLIB_ERR_NONE) {
-        Serial.printf("LoRa TX failed: %d\n", state);
-      }
+    if (xQueueReceive(lora_data_queue, &data, pdMS_TO_TICKS(1000)) == pdTRUE) {
+      latestData = data;
+      hasData = true;
     }
+
+    TickType_t now = xTaskGetTickCount();
+    if (!hasData || (now - lastUplink) < pdMS_TO_TICKS(TTN_UPLINK_INTERVAL_SECONDS * 1000UL)) {
+      continue;
+    }
+
+    uint8_t payload[2];
+    payload[0] = highByte(latestData);
+    payload[1] = lowByte(latestData);
+
+    int16_t state = ttnNode.sendReceive(payload, sizeof(payload), TTN_UPLINK_FPORT);
+    if (state < RADIOLIB_ERR_NONE) {
+      Serial.printf("LoRaWAN uplink failed: %d\n", state);
+    } else if (state > 0) {
+      Serial.println("LoRaWAN downlink received");
+    } else {
+      Serial.println("LoRaWAN uplink sent, no downlink");
+    }
+
+    lastUplink = now;
   }
 }
 
@@ -300,6 +327,7 @@ void setup() {
   lora_data_queue = xQueueCreate(10, sizeof(uint16_t)); //clearly oversized
   initWiFi();
   initLoRa();
+  initLoRaWAN();
   // Create the ADC read task on core 0 with low priority.
   xTaskCreatePinnedToCore(
     adcReadTask,
