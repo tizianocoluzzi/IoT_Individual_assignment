@@ -11,24 +11,23 @@
 
 #define SAMPLES 4096
 #define FREQ 1000
-#define WINDOWSIZE 32 //sie of the window
+#define WINDOWSIZE 64 //sie of the window
+#define FILTER_HISTORY_SIZE 15
+#define HAMPEL_THRESHOLD 3.0
+#define ZSCORE_THRESHOLD 3.0
 
 #ifndef WIFI_SSID
 #error "No wifi SSID inserted"
 #endif 
 #ifndef WIFI_PASSWORD
-#error "No wifi Passrowd inserted"
+#error "No wifi Password inserted"
 #endif
 
-#define SERVER_IP "192.168.1.41"
+#define SERVER_IP "broker.hivemq.com"
 
-#define PORT 8081
+#define PORT 1883
 #define MQTT_BUFFER_SIZE 256
 
-#define LORA_FREQUENCY 866.3
-#define LORA_BANDWIDTH 125.0
-#define LORA_SPREADING_FACTOR 9
-#define LORA_TX_POWER 10
 #define TTN_UPLINK_INTERVAL_SECONDS 60
 #define TTN_UPLINK_FPORT 1
 
@@ -44,12 +43,15 @@ ArduinoFFT<double> FFT = ArduinoFFT<double>(vReal1, vImag1, SAMPLES, FREQ);
 TaskHandle_t adcTaskHandle = NULL;
 TaskHandle_t fftTaskHandle = NULL;
 TaskHandle_t windowTaskHandle = NULL;
+TaskHandle_t filterTaskHandle = NULL;
 TaskHandle_t wifiTaskHandle = NULL;
 TaskHandle_t loraTaskHandle = NULL;
 static QueueHandle_t wifi_data_queue;
 static QueueHandle_t lora_data_queue;
 static QueueHandle_t fft_queue;
 static QueueHandle_t window_task;
+static QueueHandle_t filter_data_queue;
+
 const LoRaWANBand_t ttnRegion = EU868;
 const uint8_t ttnSubBand = 0;
 LoRaWANNode ttnNode(&radio, &ttnRegion, ttnSubBand);
@@ -75,6 +77,97 @@ typedef struct vectors{
   double* vImag;
   double mean;
 } vectors;
+
+double computeMedian(double* values, int size) {
+  for (int i = 1; i < size; i++) {
+    double key = values[i];
+    int j = i - 1;
+    while (j >= 0 && values[j] > key) {
+      values[j + 1] = values[j];
+      j--;
+    }
+    values[j + 1] = key;
+  }
+
+  if ((size % 2) == 0) {
+    return (values[(size / 2) - 1] + values[size / 2]) / 2.0;
+  }
+  return values[size / 2];
+}
+
+bool hampelFilterIsOutlier(const double* history, int historySize, double threshold, double* medianOut, double* scoreOut) {
+  if (historySize < 3) {
+    return false;
+  }
+
+  double sorted[FILTER_HISTORY_SIZE];
+  for (int i = 0; i < historySize; i++) {
+    sorted[i] = history[i];
+  }
+  const double median = computeMedian(sorted, historySize);
+
+  for (int i = 0; i < historySize; i++) {
+    sorted[i] = fabs(history[i] - median);
+  }
+  const double mad = computeMedian(sorted, historySize);
+  const double scaledMad = 1.4826 * mad;
+
+  if (medianOut != NULL) {
+    *medianOut = median;
+  }
+
+  if (scaledMad < 1e-9) {
+    if (scoreOut != NULL) {
+      *scoreOut = 0.0;
+    }
+    return false;
+  }
+
+  const double x = history[historySize - 1];
+  const double score = fabs(x - median) / scaledMad;
+  if (scoreOut != NULL) {
+    *scoreOut = score;
+  }
+  return score > threshold;
+}
+
+bool zScoreFilterIsOutlier(const double* history, int historySize, double threshold, double* meanOut, double* zScoreOut) {
+  if (historySize < 3) {
+    return false;
+  }
+
+  double mean = 0.0;
+  for (int i = 0; i < historySize; i++) {
+    mean += history[i];
+  }
+  mean /= historySize;
+
+  double variance = 0.0;
+  for (int i = 0; i < historySize; i++) {
+    const double diff = history[i] - mean;
+    variance += diff * diff;
+  }
+  variance /= historySize;
+
+  const double stdDev = sqrt(variance);
+  if (meanOut != NULL) {
+    *meanOut = mean;
+  }
+
+  if (stdDev < 1e-9) {
+    if (zScoreOut != NULL) {
+      *zScoreOut = 0.0;
+    }
+    return false;
+  }
+
+  const double x = history[historySize - 1];
+  const double zScore = fabs(x - mean) / stdDev;
+  if (zScoreOut != NULL) {
+    *zScoreOut = zScore;
+  }
+  return zScore > threshold;
+}
 
 
 void mqtt_reconnect()
@@ -103,6 +196,7 @@ void mqttTask(void *pvParameters)
 
   const char *topic = "tzn/data";
   uint16_t data;
+  uint32_t cnt = 0;
   char payload[MQTT_BUFFER_SIZE];
   for (;;)
   {
@@ -116,15 +210,24 @@ void mqttTask(void *pvParameters)
     if (xQueueReceive(wifi_data_queue, &data, pdMS_TO_TICKS(100)) == pdTRUE)
     {
       Serial.println("received data");
-      /* Append one sample to CSV */
       unsigned long timestamp_ms = millis();
       int written = snprintf(
           payload,
           MQTT_BUFFER_SIZE,
-          "%lu,%.2f\n",
-          timestamp_ms, data);
-      mqttClient.publish(topic, payload);
-      Serial.println("sent data");
+          "{\"cnt\":%lu,\"ts\":%lu,\"mean\":%u}",
+          (unsigned long)cnt++,
+          timestamp_ms,
+          (unsigned int)data);
+
+      if (written > 0 && written < MQTT_BUFFER_SIZE)
+      {
+        mqttClient.publish(topic, payload);
+        Serial.println("sent data");
+      }
+      else
+      {
+        Serial.println("payload formatting error");
+      }
     }
   }
 }
@@ -143,7 +246,6 @@ void initWiFi() {
 
 }
 
-void initLoRa() {
 void initLoRaWAN() {
   heltec_setup();
   Serial.println("LoRaWAN radio init");
@@ -228,6 +330,47 @@ void computeWindowTask(void* pvParameters){
 
 }
 
+void filterTask(void* pvParameters) {
+  uint16_t sample = 0;
+  double history[FILTER_HISTORY_SIZE] = {0.0};
+  int historyCount = 0;
+  int head = 0;
+
+  for (;;) {
+    if (xQueueReceive(filter_data_queue, &sample, portMAX_DELAY) != pdTRUE) {
+      continue;
+    }
+
+    history[head] = static_cast<double>(sample);
+    head = (head + 1) % FILTER_HISTORY_SIZE;
+    if (historyCount < FILTER_HISTORY_SIZE) {
+      historyCount++;
+    }
+
+    double ordered[FILTER_HISTORY_SIZE] = {0.0};
+    for (int i = 0; i < historyCount; i++) {
+      const int idx = (head - historyCount + i + FILTER_HISTORY_SIZE) % FILTER_HISTORY_SIZE;
+      ordered[i] = history[idx];
+    }
+
+    double hampelMedian = 0.0;
+    double hampelScore = 0.0;
+    double zMean = 0.0;
+    double zScore = 0.0;
+
+    const bool hampelOutlier = hampelFilterIsOutlier(ordered, historyCount, HAMPEL_THRESHOLD, &hampelMedian, &hampelScore);
+    const bool zOutlier = zScoreFilterIsOutlier(ordered, historyCount, ZSCORE_THRESHOLD, &zMean, &zScore);
+
+    if (hampelOutlier || zOutlier) {
+      Serial.printf("outlier rejected: %u (hampel=%.2f, z=%.2f)\n", sample, hampelScore, zScore);
+      continue;
+    }
+
+    xQueueSend(wifi_data_queue, &sample, 0);
+    xQueueSend(lora_data_queue, &sample, 0);
+  }
+}
+
 void fftTask(void* pvParameters) {
   // Arduino Serial Plotter works best with stable labels on every line.
   //Serial.println("adc\tpeak");
@@ -268,7 +411,8 @@ void fftTask(void* pvParameters) {
         } 
       }
       int sampling_freq = round(highest_freq) * 2;
-      float interval = 1000/sampling_freq; 
+      float interval = 0;
+      if(sampling_freq != 0){ interval = 1000/sampling_freq;} 
       Serial.printf("highest_freq: %lfHz, suggested sampling frequency: %dHz, time interval is: %f\n",highest_freq, sampling_freq, interval);
       //Serial.println("mean: " + String(mean));
 
@@ -298,12 +442,9 @@ void adcReadTask(void* pvParameters) {
     double mean = 0;
     for (int i = 0; i < SAMPLES; i++) {
       TickType_t st = xTaskGetTickCount();
-      int64_t start = esp_timer_get_time();
       latestAdcSample = analogRead(analogPin);
       vReal[i] = latestAdcSample;
       vImag[i] = 0; // Imaginary part is zero for real signals
-      mean += latestAdcSample;
-      int64_t end = esp_timer_get_time();
       xQueueSend(window_task,(void*) &latestAdcSample, pdMS_TO_TICKS(10));
       //Serial.printf(">exec_time:%d\r\n", end-start);
       //Serial.printf(">adc:%u\r\n", latestAdcSample);
@@ -312,7 +453,6 @@ void adcReadTask(void* pvParameters) {
     }
     vec.vReal = vReal;
     vec.vImag = vImag; 
-    vec.mean = mean/SAMPLES;
     xQueueSend(fft_queue, (void*)&vec, 0);
     //xTaskNotifyGive(fftTaskHandle); // Notify FFT task that new data is ready
   }
@@ -323,10 +463,10 @@ void setup() {
   delay(300);
   fft_queue = xQueueCreate(2, sizeof(vectors));
   window_task = xQueueCreate(10, sizeof(latestAdcSample));
+  filter_data_queue = xQueueCreate(10, sizeof(uint16_t));
   wifi_data_queue = xQueueCreate(10, sizeof(uint16_t)); //clearly oversized
   lora_data_queue = xQueueCreate(10, sizeof(uint16_t)); //clearly oversized
   initWiFi();
-  initLoRa();
   initLoRaWAN();
   // Create the ADC read task on core 0 with low priority.
   xTaskCreatePinnedToCore(
@@ -377,6 +517,23 @@ void setup() {
       vTaskDelay(pdMS_TO_TICKS(1000));
     }
   }
+
+  xTaskCreatePinnedToCore(
+    filterTask,
+    "filter task",
+    4096,
+    NULL,
+    1,
+    &filterTaskHandle,
+    1
+  );
+  if(filterTaskHandle == NULL){
+    Serial.println("Failed to create filter task");
+    while(true){
+      vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+  }
+
   xTaskCreatePinnedToCore(
     mqttTask,
     "MQTT task",
