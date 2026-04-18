@@ -81,13 +81,11 @@ def on_message(client, userdata, msg):
     loss_rate = (total_missing / (total_received + total_missing)) if (total_received + total_missing) > 0 else 0
 
     print(
-        f"Received: {counter} | "
-        f"Total recv: {total_received} | "
-        f"Missing: {total_missing} | "
-        f"Loss rate: {loss_rate:.4f} |"
         f"id: {payload["cnt"]} |"
         f"mean: {payload["mean"]} |"
-        f"exec_time {payload["window_exec_us"]}|"
+        f"exec_time: {payload["window_exec_us"]} |"
+        f"sampling freq: {payload["sampling_freq_hz"]} |"
+        f"Loss rate: {loss_rate:.4f}|"
     )
 
 # =========================

@@ -6,10 +6,10 @@ import matplotlib.pyplot as plt
 
 SERIAL_PORT = '/dev/ttyUSB0'
 BAUD_RATE = 115200
-MAX_BINS = 25
+MAX_BINS = 50
 
-FREQ = 1000
-BINS = 1024
+FREQ = 500
+BINS = 2048
 
 # ==== SERIAL SETUP ====
 

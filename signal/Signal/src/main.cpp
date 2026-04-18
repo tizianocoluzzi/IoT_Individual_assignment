@@ -2,39 +2,50 @@
 #include <math.h>
 #include "driver/i2s.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include <Wire.h>
 #include <Adafruit_INA219.h>
-//#define NO_NOISE
-#ifndef NO_NOISE
-#include <random>
-#endif
 
-#ifndef NO_NOISE
-std::default_random_engine gen;
-std::normal_distribution<double> distribution(0.0, 0.2);
-std::bernoulli_distribution spikeEvent(0.002);
-std::uniform_int_distribution<int> spikeSign(0, 1);
-#endif
 // GPIO25 is DAC1 on ESP32 boards.
 #define DAC_PIN 25
 #define SAMPLE_RATE_HZ 1000
 #define I2S_NUM I2S_NUM_0
+#define MODE_SWITCH_PIN 2
+#define SIM_BUTTON_PIN 15
+
+
 
 Adafruit_INA219 ina219(0x40);
+
+enum class SamplingMode : uint8_t {
+  Oversampling = 0,
+  Normal = 1,
+};
+
+volatile SamplingMode samplingMode = SamplingMode::Oversampling;
+
 struct HarmonicComponent {
   float amplitude;
   float frequencyHz;
 };
 
 constexpr HarmonicComponent HARMONICS[] = {
-    {1.0f, 1.0f},
+    {1.0f, 2.0f},
     {0.5f, 5.0f},
 };
+
+typedef struct Stat {
+  float sum;
+  uint cnt;
+};
+
+Stat stats[2];
+
+esp_timer_handle_t buttonPressTimer = nullptr;
+esp_timer_handle_t buttonReleaseTimer = nullptr;
+
 constexpr int NUM_HARMONICS = sizeof(HARMONICS) / sizeof(HARMONICS[0]);
-#ifndef NO_NOISE
-constexpr float NOISE_STD_DEV = 0.2f;
-constexpr float SPIKE_MAGNITUDE_MULTIPLIER = 20.0f;
-#endif
+
 
 // One phase accumulator per harmonic, avoids any wrap discontinuity
 float phases[NUM_HARMONICS] = {};
@@ -92,6 +103,35 @@ void scanI2CBus() {
   }
 }
 
+const char *samplingModeToString(SamplingMode mode) {
+  return mode == SamplingMode::Oversampling ? "OVERSAMPLING" : "NORMAL";
+}
+
+void IRAM_ATTR onModeSwitchInterrupt() {
+  if (samplingMode == SamplingMode::Oversampling) {
+    samplingMode = SamplingMode::Normal;
+  } else {
+    samplingMode = SamplingMode::Oversampling;
+  }
+}
+
+void onSimulatedButtonRelease(void *arg) {
+  (void)arg;
+  // Release button (idle high with pull-up semantics).
+  digitalWrite(SIM_BUTTON_PIN, HIGH);
+  Serial.println("Simulated button RELEASE on GPIO7");
+}
+
+void onSimulatedButtonPress(void *arg) {
+  (void)arg;
+  // Press button (active low).
+  digitalWrite(SIM_BUTTON_PIN, LOW);
+  Serial.println("Simulated button PRESS on GPIO7");
+
+  // Schedule one-shot release after 100 ms.
+  esp_timer_start_once(buttonReleaseTimer, 100000);
+}
+
 void analogSignalTask(void *pvParameters) {
   (void)pvParameters;
 
@@ -99,13 +139,7 @@ void analogSignalTask(void *pvParameters) {
   while (true) {
     advancePhases(); 
     float signal = computeSignal();
-#ifndef NO_NOISE
-    signal += static_cast<float>(distribution(gen) * NOISE_STD_DEV);
-    if (spikeEvent(gen)) {
-      float sign = spikeSign(gen) == 0 ? -1.0f : 1.0f;
-      signal += sign * SPIKE_MAGNITUDE_MULTIPLIER * max_amplitude;
-    }
-#endif
+
     float normalized = ((signal / max_amplitude + 1.0f) * 0.5f);
     normalized = constrain(normalized, 0.0f, 1.0f);
     uint8_t value = static_cast<uint8_t>(normalized * 255.0f);
@@ -121,7 +155,7 @@ void analogSignalTask(void *pvParameters) {
 void ina219ReadTask(void *pvParameters) {
   (void)pvParameters;
   vTaskDelay(pdMS_TO_TICKS(500)); // wait for Wire to be ready
-  if (!ina219.begin()) {
+  if (!ina219.begin(&Wire)) {
     Serial.println("INA219 not found. Check wiring and I2C address.");
     scanI2CBus();
     vTaskDelete(nullptr);
@@ -131,23 +165,60 @@ void ina219ReadTask(void *pvParameters) {
   while (true) {
     float busVoltage = ina219.getBusVoltage_V();
     float currentMilliAmps = ina219.getCurrent_mA();
-
+    SamplingMode activeMode = samplingMode;
+    stats[(uint8_t) activeMode].sum += currentMilliAmps;
+    stats[(uint8_t) activeMode].cnt++;
+    float mean = stats[(uint8_t) activeMode].sum / stats[(uint8_t) activeMode].cnt;
     // Better Serial Plotter format (label:value,label:value)
     // Serial.printf("Voltage:%.3f,Current_mA:%.3f\n", busVoltage, currentMilliAmps);
 
     // VS Code Serial Plotter format (CSV values)
-    Serial.printf(">V:%.3f,mA:%.3f\r\n", busVoltage, currentMilliAmps);
+    Serial.printf(">V:%.3f,mA:%.3f,mean_mode:%.3f,mode:%s\r\n",
+            busVoltage,
+            currentMilliAmps,
+            mean,
+            samplingModeToString(activeMode));
 
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    vTaskDelay(pdMS_TO_TICKS(50));
   }
 }
 
 void setup() {
   Serial.begin(115200);
   Wire.begin();
-#ifndef NO_NOISE
-  gen.seed(esp_random());
-#endif
+  Wire.setClock(100000);
+  stats[0] = {0.0f, 0};
+  stats[1] = {0.0f, 0};
+
+  samplingMode = SamplingMode::Oversampling;
+  Serial.println("Startup mode: OVERSAMPLING");
+
+  pinMode(MODE_SWITCH_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(MODE_SWITCH_PIN),
+                  onModeSwitchInterrupt,
+                  RISING);
+
+    pinMode(SIM_BUTTON_PIN, OUTPUT);
+    digitalWrite(SIM_BUTTON_PIN, HIGH);
+
+    const esp_timer_create_args_t pressTimerArgs = {
+      .callback = &onSimulatedButtonPress,
+      .arg = nullptr,
+      .dispatch_method = ESP_TIMER_TASK,
+      .name = "btn_press_1min"};
+
+    const esp_timer_create_args_t releaseTimerArgs = {
+      .callback = &onSimulatedButtonRelease,
+      .arg = nullptr,
+      .dispatch_method = ESP_TIMER_TASK,
+      .name = "btn_release"};
+
+    esp_timer_create(&pressTimerArgs, &buttonPressTimer);
+    esp_timer_create(&releaseTimerArgs, &buttonReleaseTimer);
+
+    // One-shot timer: trigger only once after 60 seconds.
+    esp_timer_start_once(buttonPressTimer, 60000000);
+
 
   // i2s_config_t i2s_config = {
   //     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_DAC_BUILT_IN),
