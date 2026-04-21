@@ -17,12 +17,8 @@
 
 Adafruit_INA219 ina219(0x40);
 
-enum class SamplingMode : uint8_t {
-  Oversampling = 0,
-  Normal = 1,
-};
-
-volatile SamplingMode samplingMode = SamplingMode::Oversampling;
+volatile int32_t switchSignalCount = -1;
+volatile bool resetRequested = false;
 
 struct HarmonicComponent {
   float amplitude;
@@ -39,7 +35,7 @@ typedef struct Stat {
   uint cnt;
 };
 
-Stat stats[2];
+Stat stats;
 
 esp_timer_handle_t buttonPressTimer = nullptr;
 esp_timer_handle_t buttonReleaseTimer = nullptr;
@@ -103,34 +99,19 @@ void scanI2CBus() {
   }
 }
 
-const char *samplingModeToString(SamplingMode mode) {
-  return mode == SamplingMode::Oversampling ? "OVERSAMPLING" : "NORMAL";
+
+void resetRuntimeState() {
+  for (int i = 0; i < NUM_HARMONICS; i++) {
+    phases[i] = 0.0f;
+  }
+  stats = {0.0f, 0};
 }
 
 void IRAM_ATTR onModeSwitchInterrupt() {
-  if (samplingMode == SamplingMode::Oversampling) {
-    samplingMode = SamplingMode::Normal;
-  } else {
-    samplingMode = SamplingMode::Oversampling;
-  }
+  switchSignalCount++;
+  resetRequested = true;
 }
 
-void onSimulatedButtonRelease(void *arg) {
-  (void)arg;
-  // Release button (idle high with pull-up semantics).
-  digitalWrite(SIM_BUTTON_PIN, HIGH);
-  Serial.println("Simulated button RELEASE on GPIO7");
-}
-
-void onSimulatedButtonPress(void *arg) {
-  (void)arg;
-  // Press button (active low).
-  digitalWrite(SIM_BUTTON_PIN, LOW);
-  Serial.println("Simulated button PRESS on GPIO7");
-
-  // Schedule one-shot release after 100 ms.
-  esp_timer_start_once(buttonReleaseTimer, 100000);
-}
 
 void analogSignalTask(void *pvParameters) {
   (void)pvParameters;
@@ -165,19 +146,22 @@ void ina219ReadTask(void *pvParameters) {
   while (true) {
     float busVoltage = ina219.getBusVoltage_V();
     float currentMilliAmps = ina219.getCurrent_mA();
-    SamplingMode activeMode = samplingMode;
-    stats[(uint8_t) activeMode].sum += currentMilliAmps;
-    stats[(uint8_t) activeMode].cnt++;
-    float mean = stats[(uint8_t) activeMode].sum / stats[(uint8_t) activeMode].cnt;
+    stats.sum += currentMilliAmps;
+    stats.cnt++;
+    float mean = stats.sum / stats.cnt;
     // Better Serial Plotter format (label:value,label:value)
-    // Serial.printf("Voltage:%.3f,Current_mA:%.3f\n", busVoltage, currentMilliAmps);
+    Serial.printf("%.3f\t%.3f\t%d\n", currentMilliAmps,mean, switchSignalCount);
 
     // VS Code Serial Plotter format (CSV values)
-    Serial.printf(">V:%.3f,mA:%.3f,mean_mode:%.3f,mode:%s\r\n",
-            busVoltage,
-            currentMilliAmps,
-            mean,
-            samplingModeToString(activeMode));
+    //Serial.printf(">V:%.3f,mA:%.3f,mean_mode:%.3f,mode:%d\r\n",
+    //        busVoltage,
+    //        currentMilliAmps,
+    //        mean,
+    //        switchSignalCount);
+
+    if (resetRequested) {
+      Serial.printf("switch_count:%lu\r\n", static_cast<unsigned long>(switchSignalCount));
+    }
 
     vTaskDelay(pdMS_TO_TICKS(50));
   }
@@ -187,37 +171,15 @@ void setup() {
   Serial.begin(115200);
   Wire.begin();
   Wire.setClock(100000);
-  stats[0] = {0.0f, 0};
-  stats[1] = {0.0f, 0};
-
-  samplingMode = SamplingMode::Oversampling;
-  Serial.println("Startup mode: OVERSAMPLING");
-
+  stats = {0.0f, 0};
   pinMode(MODE_SWITCH_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(MODE_SWITCH_PIN),
                   onModeSwitchInterrupt,
-                  RISING);
+                  FALLING);
 
     pinMode(SIM_BUTTON_PIN, OUTPUT);
     digitalWrite(SIM_BUTTON_PIN, HIGH);
 
-    const esp_timer_create_args_t pressTimerArgs = {
-      .callback = &onSimulatedButtonPress,
-      .arg = nullptr,
-      .dispatch_method = ESP_TIMER_TASK,
-      .name = "btn_press_1min"};
-
-    const esp_timer_create_args_t releaseTimerArgs = {
-      .callback = &onSimulatedButtonRelease,
-      .arg = nullptr,
-      .dispatch_method = ESP_TIMER_TASK,
-      .name = "btn_release"};
-
-    esp_timer_create(&pressTimerArgs, &buttonPressTimer);
-    esp_timer_create(&releaseTimerArgs, &buttonReleaseTimer);
-
-    // One-shot timer: trigger only once after 60 seconds.
-    esp_timer_start_once(buttonPressTimer, 60000000);
 
 
   // i2s_config_t i2s_config = {
@@ -254,6 +216,14 @@ void setup() {
 }
 
 void loop() {
+  if (resetRequested) {
+    noInterrupts();
+    resetRequested = false;
+    interrupts();
+
+    resetRuntimeState();
+  }
+
   // Nothing needed here because FreeRTOS task handles waveform generation.
-  vTaskDelay(pdMS_TO_TICKS(1000));
+  vTaskDelay(pdMS_TO_TICKS(10));
 }
