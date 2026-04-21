@@ -4,4 +4,5 @@
 #include "freertos/queue.h"
 
 bool initFilterTask(QueueHandle_t inputQueue,
-                    QueueHandle_t fftOutputQueue);
+                    QueueHandle_t fftOutputQueue,
+                    QueueHandle_t windowOutputQueue);

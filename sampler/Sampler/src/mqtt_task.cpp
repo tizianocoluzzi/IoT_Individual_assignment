@@ -22,6 +22,17 @@ static PubSubClient* sMqttClient = NULL;
 static const char* sPublishTopic = NULL;
 static const char* sTimeTopic = NULL;
 
+static const char* filterTypeToString(uint8_t type) {
+  return (type == FILTER_TYPE_HAMPEL) ? "hampel" : "zscore";
+}
+
+static const char* filterAppliedToString() {
+  if (!gFilterEnabled) {
+    return "none";
+  }
+  return filterTypeToString(gFilterType);
+}
+
 static void mqtt_reconnect() {
   while (!sMqttClient->connected()) {
     Serial.print("Connecting to MQTT...");
@@ -71,8 +82,8 @@ static void handle_response(char* topic, byte* payload, unsigned int length) {
 
   double offset = ((resp.t2 - resp.t1) + (resp.t3 - t4)) / 2.0;
   double latency = ((t4 - resp.t1) - (resp.t3 - resp.t2)) / 2.0;
+  gPreviousLatencyUs = static_cast<int32_t>(latency);
   (void)offset;
-  (void)latency;
 }
 
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
@@ -100,12 +111,24 @@ static void mqttTask(void* pvParameters) {
         unsigned long timestamp_ms = esp_timer_get_time();
         int written = snprintf(payload,
                                MQTT_BUFFER_SIZE,
-                               "{\"cnt\":%lu,\"t1\":%lu,\"mean\":%u,\"window_exec_us\":%lu,\"sampling_freq_hz\":%lu}",
+             "{\"cnt\":%lu,\"t1\":%lu,\"mean\":%u,\"window_exec_us\":%lu,\"sampling_freq_hz\":%lu,\"adaptive_sampling\":%u,\"noise_enabled\":%u,\"spike_probability\":%.3f,\"filter_window_size\":%u,\"auto_profile\":%lu,\"filter_applied\":\"%s\",\"filter_mean_exec_us\":%lu,\"tp\":%lu,\"tn\":%lu,\"fp\":%lu,\"fn\":%lu,\"previous_latency_us\":%ld}",
                                (unsigned long)cnt++,
                                timestamp_ms,
                                (unsigned int)packet.mean,
                                (unsigned long)packet.windowExecUs,
-                               (unsigned long)gSamplingFrequencyHz);
+                       (unsigned long)gSamplingFrequencyHz,
+                 static_cast<unsigned int>(gAdaptiveSamplingEnabled ? 1U : 0U),
+                 static_cast<unsigned int>(gNoiseEnabled ? 1U : 0U),
+                 static_cast<double>(gNoiseSpikeProbability),
+               static_cast<unsigned int>(gFilterHistorySize),
+                 (unsigned long)gAutoProfileIndex,
+                 filterAppliedToString(),
+                       (unsigned long)gFilterMeanExecUs,
+                       (unsigned long)gFilterTruePositives,
+                       (unsigned long)gFilterTrueNegatives,
+                       (unsigned long)gFilterFalsePositives,
+                       (unsigned long)gFilterFalseNegatives,
+                       static_cast<long>(gPreviousLatencyUs));
 
         if (written > 0 && written < MQTT_BUFFER_SIZE)
         {

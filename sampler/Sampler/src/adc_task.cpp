@@ -12,22 +12,30 @@
 
 static TaskHandle_t sAdcTaskHandle = NULL;
 static QueueHandle_t sFftSampleOutputQueue = NULL;
-static QueueHandle_t sWindowSampleOutputQueue = NULL;
 
-#ifdef ADD_NOISE
 static std::mt19937 sNoiseRng(esp_random());
 static std::normal_distribution<double> sGaussianNoise(0.0, NOISE_GAUSSIAN_SIGMA);
 static std::uniform_real_distribution<double> sUniform01(0.0, 1.0);
 
-static int32_t addSyntheticNoise(int32_t sample) {
+static int32_t addSyntheticNoise(int32_t sample, bool* isSpikeContaminatedOut) {
   const double gaussian = sGaussianNoise(sNoiseRng);
-  Serial.printf(">noise: %lf\r\n", gaussian);
+  //Serial.printf(">noise: %lf\r\n", gaussian);
   double noisy = static_cast<double>(sample) + gaussian;
+  bool spikeInjected = false;
 
-  if (sUniform01(sNoiseRng) < NOISE_SPIKE_PROBABILITY) {
+  double spikeProbability = static_cast<double>(gNoiseSpikeProbability);
+  if (spikeProbability < 0.0) {
+    spikeProbability = 0.0;
+  }
+  if (spikeProbability > 1.0) {
+    spikeProbability = 1.0;
+  }
+
+  if (sUniform01(sNoiseRng) < spikeProbability) {
     const double sign = (sUniform01(sNoiseRng) < 0.5) ? -1.0 : 1.0;
-    ESP_LOGI("SIGNAL", "noise generated");
+    //ESP_LOGI("SIGNAL", "noise generated");
     noisy += sign * NOISE_SPIKE_AMPLITUDE;
+    spikeInjected = true;
   }
 
   if (noisy < 0.0) {
@@ -37,9 +45,12 @@ static int32_t addSyntheticNoise(int32_t sample) {
     noisy = 4095.0;
   }
 
+  if (isSpikeContaminatedOut != NULL) {
+    *isSpikeContaminatedOut = spikeInjected;
+  }
+
   return static_cast<int32_t>(noisy);
 }
-#endif
 
 static void adcReadTask(void* pvParameters) {
   (void)pvParameters;
@@ -48,51 +59,49 @@ static void adcReadTask(void* pvParameters) {
   adc1_config_channel_atten(ADC1_CHANNEL_1, ADC_ATTEN_DB_11);
 
   uint16_t latestAdcSample = 0;
-  
-  uint8_t prevSamplingInterval = BASE_SAMPLING_INTERVAL_MS;
 
   for (;;) {
     const uint32_t sampleIntervalMs =
         gAdaptiveSamplingEnabled ? gAdaptiveSamplingIntervalMs : BASE_SAMPLING_INTERVAL_MS;
-    //if state changed sends a signal to the monitor to allow to reset mean value for calculation
-    if(sampleIntervalMs != prevSamplingInterval){
-      digitalWrite(SAMPLING_SWITCH_PIN, HIGH);
-      delay(100);
-      digitalWrite(SAMPLING_SWITCH_PIN, LOW);
-
-    }
     gSamplingFrequencyHz = (sampleIntervalMs > 0) ? (1000UL / sampleIntervalMs) : 0;
 
 
-    for(int i = 0; i < SAMPLES; i++){
+    //for(int i = 0; i < SAMPLES; i++){
       TickType_t st = xTaskGetTickCount();
       latestAdcSample = adc1_get_raw(ADC1_CHANNEL_1);
 
       uint16_t sampleForPipelines = latestAdcSample;
-      Serial.printf(">prenoise:%d\r\n",sampleForPipelines);
-#ifdef ADD_NOISE
-      sampleForPipelines = static_cast<uint16_t>(addSyntheticNoise(static_cast<int32_t>(latestAdcSample)));
-#endif
-      xQueueSend(sFftSampleOutputQueue, (void *)&sampleForPipelines, 0);
-      xQueueSend(sWindowSampleOutputQueue, (void *)&sampleForPipelines, 0);
+      bool isSpikeContaminated = false;
+      //Serial.printf(">prenoise:%d\r\n",sampleForPipelines);
+      if (gNoiseEnabled) {
+        sampleForPipelines = static_cast<uint16_t>(
+            addSyntheticNoise(static_cast<int32_t>(latestAdcSample), &isSpikeContaminated));
+      }
+
+      adc_sample_packet filterPacket = {
+          .value = sampleForPipelines,
+          .isSpikeContaminated = isSpikeContaminated,
+      };
+      xQueueSend(sFftSampleOutputQueue, (void *)&filterPacket, 0);
 
       BaseType_t ret = xTaskDelayUntil(&st, pdMS_TO_TICKS(sampleIntervalMs));
       if (ret == pdFALSE)
       {
         Serial.println("[ADC] error, could not make it");
       }
-    }
+    //}
   }
 }
 
 bool initAdcTask(QueueHandle_t fftSampleOutputQueue,
                  QueueHandle_t windowSampleOutputQueue) {
-  if (fftSampleOutputQueue == NULL || windowSampleOutputQueue == NULL) {
+  (void)windowSampleOutputQueue;
+
+  if (fftSampleOutputQueue == NULL) {
     return false;
   }
 
   sFftSampleOutputQueue = fftSampleOutputQueue;
-  sWindowSampleOutputQueue = windowSampleOutputQueue;
-  xTaskCreatePinnedToCore(adcReadTask, "ADC Read Task", 4096, NULL, 1, &sAdcTaskHandle, 0);
+  xTaskCreatePinnedToCore(adcReadTask, "ADC Read Task", 8192, NULL, 1, &sAdcTaskHandle, 0);
   return sAdcTaskHandle != NULL;
 }

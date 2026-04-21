@@ -2,28 +2,23 @@
 
 #include <Arduino.h>
 
-#define SAMPLES 4096
-#define FREQ 100
-#define BUTTON_PIN 46 //0 for manual toggling 
+#define SAMPLES 2048
+#define FREQ 500
+#define BUTTON_PIN 0 //0 for manual toggling 
 #define WINDOWSIZE 64
-#define FILTER_HISTORY_SIZE 31
+#define FILTER_HISTORY_SIZE 71
 #define HAMPEL_THRESHOLD 3.0
-#define ZSCORE_THRESHOLD 3.0
-#define FILTER_ALPHA 0.20
+#define ZSCORE_THRESHOLD 2.5
 
 #define NOISE_GAUSSIAN_SIGMA 100 //high value because sample is integer in 16 bits, so sigma of 100 is low
-#define NOISE_SPIKE_AMPLITUDE 1000.0
-#define NOISE_SPIKE_PROBABILITY 0.11
+#define NOISE_SPIKE_AMPLITUDE 1500.0
+#define NOISE_SPIKE_PROBABILITY 0.01
 
 #define SERVER_IP "broker.hivemq.com"
 #define PORT 1883
-#define MQTT_BUFFER_SIZE 256
+#define MQTT_BUFFER_SIZE 512
 
 #define SAMPLING_SWITCH_PIN 45
-
-#define FILTER
-#define ADD_NOISE
-
 #define TTN_UPLINK_INTERVAL_SECONDS 60
 #define TTN_UPLINK_FPORT 1
 
@@ -41,6 +36,11 @@ typedef struct telemetry_packet {
   uint16_t mean;
   uint32_t windowExecUs;
 } telemetry_packet;
+
+typedef struct adc_sample_packet {
+  uint16_t value;
+  bool isSpikeContaminated;
+} adc_sample_packet;
 
 typedef struct {
   uint32_t id;

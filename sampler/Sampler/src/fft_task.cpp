@@ -71,12 +71,17 @@ static void fftTask(void* pvParameters) {
     }
 
     int sampling_freq = round(highest_freq) * 2;
-    if (gAdaptiveSamplingEnabled && sampling_freq > 0) {
+    if (sampling_freq > 0) {
       uint32_t newIntervalMs = static_cast<uint32_t>(round(1000.0 / static_cast<double>(sampling_freq)));
       if (newIntervalMs == 0) {
         newIntervalMs = 1;
       }
       gAdaptiveSamplingIntervalMs = newIntervalMs;
+    }
+
+    if (gAutoSwitchTaskHandle != NULL) {
+      xTaskNotifyGive(gAutoSwitchTaskHandle);
+      vTaskDelay(1);
     }
 
     sampleCount = 0;

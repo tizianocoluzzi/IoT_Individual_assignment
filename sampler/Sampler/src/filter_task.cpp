@@ -3,15 +3,30 @@
 #include <Arduino.h>
 
 #include "common_types.h"
-
-#define HAMPEL
-#ifndef HAMPEL
-#define ZSCORE
-#endif
+#include "runtime_state.h"
 
 static TaskHandle_t sFilterTaskHandle = NULL;
 static QueueHandle_t sInputQueue = NULL;
 static QueueHandle_t sFftOutputQueue = NULL;
+static QueueHandle_t sWindowOutputQueue = NULL;
+
+static const char* filterTypeToString(uint8_t type) {
+  return (type == FILTER_TYPE_HAMPEL) ? "hampel" : "zscore";
+}
+
+static uint16_t normalizeFilterHistorySize(uint16_t requestedSize) {
+  uint16_t normalized = requestedSize;
+  if (normalized < 3) {
+    normalized = 3;
+  }
+  if (normalized > FILTER_HISTORY_SIZE) {
+    normalized = FILTER_HISTORY_SIZE;
+  }
+  if ((normalized % 2U) == 0U) {
+    normalized--;
+  }
+  return normalized;
+}
 
 static double computeMedian(double* values, int size) {
   for (int i = 1; i < size; i++) {
@@ -70,7 +85,6 @@ static bool hampelFilterIsOutlier(const double* history,
   return score > threshold;
 }
 
-#ifndef HAMPEL
 static bool zScoreFilterIsOutlier(const double* history,
                                   int historySize,
                                   double threshold,
@@ -79,19 +93,22 @@ static bool zScoreFilterIsOutlier(const double* history,
   if (historySize < 3) {
     return false;
   }
+  int k  =  historySize / 2; //index evaluated
 
   double mean = 0.0;
   for (int i = 0; i < historySize; i++) {
+    if(i == k) continue;
     mean += history[i];
   }
-  mean /= historySize;
+  mean /= (historySize - 1);
 
   double variance = 0.0;
   for (int i = 0; i < historySize; i++) {
+    if(i == k) continue;
     const double diff = history[i] - mean;
     variance += diff * diff;
   }
-  variance /= historySize;
+  variance /= (historySize - 1);
 
   const double stdDev = sqrt(variance);
   if (meanOut != NULL) {
@@ -112,133 +129,207 @@ static bool zScoreFilterIsOutlier(const double* history,
   }
   return zScore > threshold;
 }
-#endif
 
 static void filterTask(void* pvParameters) {
   (void)pvParameters;
 
-  typedef struct {
-    uint32_t sampleId;
-    bool spikeInjected;
-    bool clamped;
-    float gaussian;
-    float spikeApplied;
-  } sample_meta_t;
-
-  filter_input_sample input = {};
+  adc_sample_packet inputSample = {};
   double history[FILTER_HISTORY_SIZE] = {0.0};  // raw ring buffer
-  sample_meta_t historyMeta[FILTER_HISTORY_SIZE] = {};
+  bool contaminationHistory[FILTER_HISTORY_SIZE] = {false};
   int head = 0;
   int historyCount = 0;
-  uint32_t tp = 0;
-  uint32_t fp = 0;
-  uint32_t tn = 0;
-  uint32_t fn = 0;
+  uint16_t activeHistorySize = normalizeFilterHistorySize(gFilterHistorySize);
 
-  const int k = FILTER_HISTORY_SIZE / 2;  // half-window, center offset
+  uint32_t truePositives = 0;
+  uint32_t falsePositives = 0;
+  uint32_t trueNegatives = 0;
+  uint32_t falseNegatives = 0;
+  uint32_t evaluatedSamples = 0;
+  uint64_t totalFilterExecUs = 0;
+  bool wasAdaptiveSamplingEnabled = gAdaptiveSamplingEnabled;
+  bool wasFilterEnabled = gFilterEnabled;
+  uint8_t previousFilterType = gFilterType;
+  float previousSpikeProbability = gNoiseSpikeProbability;
+  uint16_t previousHistorySize = activeHistorySize;
 
   for (;;) {
-    if (xQueueReceive(sInputQueue, &input, portMAX_DELAY) != pdTRUE) {
+    if (xQueueReceive(sInputQueue, &inputSample, portMAX_DELAY) != pdTRUE) {
       continue;
     }
 
+    const bool isAdaptiveSamplingEnabledNow = gAdaptiveSamplingEnabled;
+    const bool isFilterEnabledNow = gFilterEnabled;
+    const uint8_t filterTypeNow = gFilterType;
+    const float spikeProbabilityNow = gNoiseSpikeProbability;
+    const uint16_t currentHistorySize = normalizeFilterHistorySize(gFilterHistorySize);
+    const bool modeChanged =
+        (wasAdaptiveSamplingEnabled != isAdaptiveSamplingEnabledNow) ||
+        (wasFilterEnabled != isFilterEnabledNow) ||
+        (previousFilterType != filterTypeNow) ||
+      (fabs(spikeProbabilityNow - previousSpikeProbability) > 1e-6f) ||
+      (previousHistorySize != currentHistorySize);
+
+    if (modeChanged) {
+      truePositives = 0;
+      falsePositives = 0;
+      trueNegatives = 0;
+      falseNegatives = 0;
+      evaluatedSamples = 0;
+      totalFilterExecUs = 0;
+      head = 0;
+      historyCount = 0;
+
+      for (int i = 0; i < FILTER_HISTORY_SIZE; i++) {
+        history[i] = 0.0;
+        contaminationHistory[i] = false;
+      }
+
+      gFilterMeanExecUs = 0;
+      gFilterTruePositives = 0;
+      gFilterFalsePositives = 0;
+      gFilterTrueNegatives = 0;
+      gFilterFalseNegatives = 0;
+
+        activeHistorySize = currentHistorySize;
+
+      Serial.printf(
+          "[FILTER] Metrics reset: sampling=%s filter=%s type=%s spike_prob=%.3f history=%u\n",
+          isAdaptiveSamplingEnabledNow ? "adaptive" : "oversampling",
+          isFilterEnabledNow ? "enabled" : "disabled",
+          filterTypeToString(filterTypeNow),
+          static_cast<double>(spikeProbabilityNow),
+          static_cast<unsigned int>(activeHistorySize));
+    }
+
+    wasAdaptiveSamplingEnabled = isAdaptiveSamplingEnabledNow;
+    wasFilterEnabled = isFilterEnabledNow;
+    previousFilterType = filterTypeNow;
+    previousSpikeProbability = spikeProbabilityNow;
+    previousHistorySize = activeHistorySize;
+
+    if (!isFilterEnabledNow) {
+      uint16_t passthroughSample = inputSample.value;
+      xQueueSend(sFftOutputQueue, &passthroughSample, 0);
+      xQueueSend(sWindowOutputQueue, &passthroughSample, 0);
+      continue;
+    }
+
+    const int64_t startUs = esp_timer_get_time();
+
     // Store raw sample
-    history[head] = static_cast<double>(input.value);
-    historyMeta[head] = {
-      .sampleId = input.sampleId,
-      .spikeInjected = input.spikeInjected,
-      .clamped = input.clamped,
-      .gaussian = input.gaussian,
-      .spikeApplied = input.spikeApplied,
-    };
+    history[head] = static_cast<double>(inputSample.value);
+    contaminationHistory[head] = inputSample.isSpikeContaminated;
     head = (head + 1) % FILTER_HISTORY_SIZE;
     if (historyCount < FILTER_HISTORY_SIZE) {
       historyCount++;
     }
 
     // Wait until we have a full window before emitting anything
-    if (historyCount < FILTER_HISTORY_SIZE) {
+    if (historyCount < activeHistorySize) {
       continue;
     }
 
-    // Build ordered window (oldest → newest)
+    const int effectiveWindowSize = static_cast<int>(activeHistorySize);
+    const int k = effectiveWindowSize / 2;  // half-window, center offset
+
+    // Build ordered window (oldest → newest) from latest effectiveWindowSize samples.
     double ordered[FILTER_HISTORY_SIZE];
-    for (int i = 0; i < FILTER_HISTORY_SIZE; i++) {
-      const int idx = (head + i) % FILTER_HISTORY_SIZE;
-      ordered[i] = history[idx];
+    const int orderedStart =
+        (head + FILTER_HISTORY_SIZE - effectiveWindowSize) % FILTER_HISTORY_SIZE;
+    for (int i = 0; i < effectiveWindowSize; i++) {
+      ordered[i] = history[(orderedStart + i) % FILTER_HISTORY_SIZE];
     }
 
     double replace = 0.0;
     bool is_outlier = false;
 
-    #ifdef HAMPEL
-    double hampelMedian = 0.0, hampelScore = 0.0;
-    is_outlier = hampelFilterIsOutlier(ordered, FILTER_HISTORY_SIZE,
-                                       HAMPEL_THRESHOLD,
-                                       &hampelMedian, &hampelScore);
-    replace = hampelMedian;
-    #else
-    double zMean = 0.0, zScore = 0.0;
-    is_outlier = zScoreFilterIsOutlier(ordered, FILTER_HISTORY_SIZE,
-                                       ZSCORE_THRESHOLD,
-                                       &zMean, &zScore);
-    replace = zMean;
-    #endif
+    if (filterTypeNow == FILTER_TYPE_HAMPEL) {
+      double hampelMedian = 0.0;
+      double hampelScore = 0.0;
+      is_outlier = hampelFilterIsOutlier(ordered,
+                                         effectiveWindowSize,
+                                         HAMPEL_THRESHOLD,
+                                         &hampelMedian,
+                                         &hampelScore);
+      replace = hampelMedian;
+    } else {
+      double zMean = 0.0;
+      double zScore = 0.0;
+      is_outlier = zScoreFilterIsOutlier(ordered,
+                                         effectiveWindowSize,
+                                         ZSCORE_THRESHOLD,
+                                         &zMean,
+                                         &zScore);
+      replace = zMean;
+    }
 
     double sampleForFft = ordered[k];  // center sample
-    const int centerIdx = (head + k) % FILTER_HISTORY_SIZE;
-    const sample_meta_t centerMeta = historyMeta[centerIdx];
-    const bool gtIsOutlier = centerMeta.spikeInjected;
-    const uint32_t centerSampleId = centerMeta.sampleId;
+    const bool isActuallySpike =
+        contaminationHistory[(orderedStart + k) % FILTER_HISTORY_SIZE];
 
+    if (is_outlier) {
+      if (isActuallySpike) {
+        truePositives++;
+      } else {
+        falsePositives++;
+      }
+    } else {
+      if (isActuallySpike) {
+        falseNegatives++;
+      } else {
+        trueNegatives++;
+      }
+    }
+    evaluatedSamples++;
+    gFilterTruePositives = truePositives;
+    gFilterFalsePositives = falsePositives;
+    gFilterTrueNegatives = trueNegatives;
+    gFilterFalseNegatives = falseNegatives;
+
+    //Serial.printf(">noisy:%lf\r\n", sampleForFft);
     if (is_outlier) {
       sampleForFft = replace;
       // Patch raw history so spikes don't poison future windows
+      int centerIdx = (orderedStart + k) % FILTER_HISTORY_SIZE;
       history[centerIdx] = replace;
     }
 
-    if (gtIsOutlier && is_outlier) {
-      tp++;
-    } else if (!gtIsOutlier && is_outlier) {
-      fp++;
-    } else if (gtIsOutlier && !is_outlier) {
-      fn++;
-    } else {
-      tn++;
-    }
-
-    const uint32_t processed = tp + fp + tn + fn;
-    if (FILTER_MAP_PRINT_EVENTS_ONLY == 0 || gtIsOutlier || is_outlier) {
-      Serial.printf(">map:id=%lu,gt=%d,pred=%d,noisy=%0.2lf,filtered=%0.2lf,gauss=%0.2f,spike=%0.2f,clamp=%d\r\n",
-                    static_cast<unsigned long>(centerSampleId), gtIsOutlier ? 1 : 0,
-                    is_outlier ? 1 : 0, ordered[k], sampleForFft,
-                    centerMeta.gaussian, centerMeta.spikeApplied, centerMeta.clamped ? 1 : 0);
-    }
-    if (FILTER_METRICS_PRINT_EVERY > 0 && (processed % FILTER_METRICS_PRINT_EVERY) == 0) {
-      const double tpr = (tp + fn) > 0 ? static_cast<double>(tp) / static_cast<double>(tp + fn) : 0.0;
-      const double fpr = (fp + tn) > 0 ? static_cast<double>(fp) / static_cast<double>(fp + tn) : 0.0;
-      Serial.printf(">metrics:n=%lu,tp=%lu,fp=%lu,tn=%lu,fn=%lu,tpr=%0.4lf,fpr=%0.4lf\r\n",
-                    static_cast<unsigned long>(processed),
-                    static_cast<unsigned long>(tp),
-                    static_cast<unsigned long>(fp),
-                    static_cast<unsigned long>(tn),
-                    static_cast<unsigned long>(fn),
-                    tpr, fpr);
-    }
+    //Serial.printf(">filtered:%lf\r\n", sampleForFft);
+    //if ((evaluatedSamples % 128U) == 0U) {
+    //  const double tprDen = static_cast<double>(truePositives + falseNegatives);
+    //  const double fprDen = static_cast<double>(falsePositives + trueNegatives);
+    //  const double tpr = (tprDen > 0.0) ? (static_cast<double>(truePositives) / tprDen) : 0.0;
+    //  const double fpr = (fprDen > 0.0) ? (static_cast<double>(falsePositives) / fprDen) : 0.0;
+    //  Serial.printf("[FILTER] eval=%lu TP=%lu FP=%lu TN=%lu FN=%lu TPR=%.4f FPR=%.4f\n",
+    //                static_cast<unsigned long>(evaluatedSamples),
+    //                static_cast<unsigned long>(truePositives),
+    //                static_cast<unsigned long>(falsePositives),
+    //                static_cast<unsigned long>(trueNegatives),
+    //                static_cast<unsigned long>(falseNegatives),
+    //                tpr,
+    //                fpr);
+    //}
 
     uint16_t outputSample = static_cast<uint16_t>(round(sampleForFft));
+    const uint32_t filterExecUs = static_cast<uint32_t>(esp_timer_get_time() - startUs);
+    totalFilterExecUs += static_cast<uint64_t>(filterExecUs);
+    gFilterMeanExecUs = static_cast<uint32_t>(totalFilterExecUs / evaluatedSamples);
+
     xQueueSend(sFftOutputQueue, &outputSample, 0);
+    xQueueSend(sWindowOutputQueue, &outputSample,0);
   }
 }
 
 bool initFilterTask(QueueHandle_t inputQueue,
-                    QueueHandle_t fftOutputQueue) {
-  if (inputQueue == NULL || fftOutputQueue == NULL) {
+                    QueueHandle_t fftOutputQueue,
+                    QueueHandle_t windowOutputQueue) {
+  if (inputQueue == NULL || fftOutputQueue == NULL || windowOutputQueue == NULL) {
     return false;
   }
 
   sInputQueue = inputQueue;
   sFftOutputQueue = fftOutputQueue;
+  sWindowOutputQueue = windowOutputQueue;
 
   xTaskCreatePinnedToCore(filterTask, "filter task", 4096, NULL, 1, &sFilterTaskHandle, 1);
   return sFilterTaskHandle != NULL;
