@@ -34,8 +34,9 @@ To achive the flexibilty I used a specific struct called profileRuntime that def
 | filter type       | `{hampel, z-score` |
 | spike probability | `{1%, 5%, 10%}` |
 | filter window size| `{5, 15, 31} *`| 
+
 *samples
-#### Test Execution | 
+#### Test Execution  
 
 * Each configuration (profileRuntime) was executed for the duration of FFT window 
 * Reported values represent **mean averages**
@@ -181,6 +182,9 @@ The receiver is in locale, uising paho.mqtt library I implemented a program that
 ### LoRaWan + TTN sending
 In order to send the values to the lora I registered the device to the [TTN](https://eu1.cloud.thethings.network) and removed the nonce verification in order to connect multiple times with the same nonce. This is not a good practice of security, used for demo purpose only. 
 
+![TTN dashboard](./docs/lora_dasboard.png)
+
+
 ## System performance
 The core section of the report is the measure of the performance of the system.
 ### Energy saving
@@ -271,6 +275,7 @@ To have the possibility to calculate TPR and FPR for the filter identifier I imp
 ##### Noise impact
 The noise addiction without adding the filter did not alter the FFT computation since the condition for identify peaks showed to be strong enough to resist outliers and zero mean gaussian noise.
 this implies that from the point of view of the network traffic nothing changed because the two frequency did not change.
+
 #### Filters
 The two chosen filters are: z-score and hampel filter, they work in a different way, hampel evaluate if a sample is an outlier using MAD (median absolute deviation) while z-score uses standard deviation.
 The filters are implemented as a sliding window centered in the sample that is evaluated.
@@ -452,3 +457,4 @@ Some little guidelines I'll try to follow from now on:
 "previous_latency_us":,
 }
 ```
+

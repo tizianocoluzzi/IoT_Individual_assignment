@@ -29,6 +29,14 @@ constexpr HarmonicComponent HARMONICS[] = {
     {1.0f, 2.0f},
     {0.5f, 5.0f},
 };
+/*constexpr HarmonicComponent HARMONICS[] = {
+    {1.0f, 3.0f},
+    {0.15f, 4.0f},
+};*/
+/*constexpr HarmonicComponent HARMONICS[] = {
+    {0.5f, 1.0f},
+    {0.3f, 10.0f},
+};*/
 
 typedef struct Stat {
   float sum;
