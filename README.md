@@ -4,34 +4,56 @@ Individual assigment of the IoT Algorithm and Services course in Spienza Enginee
 The purpose of the project is to design an IoT system capable to adapt its sampling rate to the simulated environment, compute some aggregation function and comunicate the value over the network using two comunication standard for IoT: TTN over LoRa and MQTT over WiFi.
 The performance evaluation is a crucial part of this report because enlight the capability of the system to meet requirements.
 ### Goal
-Using Arduino Framework write a signal generator and a sampler with the following tasks:
-- oversampling
-- identify optimal sampling frequency
-- compute aggregation function over a window
-- communicate the aggregated value using MQTT over WiFi
-- communicate the aggregated value over LoRaWAN
-- performance measurement:
-    - energy saving
-    - per-window execution time
-    - data volume transmitted
-    - end-to-end latency of the system
-- bonus:
-    - consider noise and spikes in the signal
-    - use anomaly aware filters: Z-score, Hamper and evaluate TPR FPR Mean Error Reduction
-    - execution time and energy impact of the filters
-    - impact of the anomalies in the FFT
-    - impact with the filtering ??
-    - measure the effect on the window size, in particular energy consumption, end-to-end delay, memory usage.
+
+## Requirements Mapping
+
+The following table explicitly maps the assignment requirements to the implemented components of the system.
+
+| Requirement                               | Implementation                                                      | Reference Section                   |
+| ----------------------------------------- | ------------------------------------------------------------------- | ----------------------------------- |
+| Maximum sampling frequency identification | Empirical evaluation using FreeRTOS task timing (`xTaskDelayUntil`) | Maximum Frequency                   |
+| Adaptive sampling using FFT               | `arduinoFFT` + dynamic threshold peak detection                     | Identify Optimal Sampling Frequency |
+| Aggregate computation                     | Tumbling window mean (fixed 64 samples)                             | Computing over a Window             |
+| MQTT communication                        | JSON payload over WiFi using HiveMQ broker                          | MQTT Sending                        |
+| LoRaWAN communication                     | TTN integration using Heltec ESP32 LoRa V3                          | LoRaWAN + TTN Sending               |
+| Energy measurement                        | INA219 current monitoring                                           | Energy Saving                       |
+| Execution time measurement                | `esp_timer_get_time()`                                              | Per Window Execution Time           |
+| Network traffic analysis                  | Wireshark + analytical model                                        | Network Traffic                     |
+| End-to-end latency                        | RTT-based measurement using MQTT feedback loop                      | Latency                             |
+| Noise and anomaly filtering (bonus)       | Z-score and Hampel filters                                          | Bonus Section                       |
+
 ### System design
 My principal goal was to have system that was "_plug and play_", so that once setup would produce the necessary data to be then fully analized an reproducible.
 #### Test
 To achive the flexibilty I used a specific struct called profileRuntime that defines the condition of the sunning system using the following parameters:
-- adaptive sampling
-- is noise enabled
-- is filter enabled 
-- filter type
-- spike probability
-- filter window size
+| parameter | values |
+| -- | -- |
+| adaptive sampling | `{true, false}` |
+| is noise enabled  | `{true, false}` |
+| is filter enabled | `{true, false}` |
+| filter type       | `{hampel, z-score` |
+| spike probability | `{1%, 5%, 10%}` |
+| filter window size| `{5, 15, 31} *`| 
+*samples
+#### Test Execution | 
+
+* Each configuration (profileRuntime) was executed for the duration of FFT window 
+* Reported values represent **mean averages**
+
+#### Measurement Setup
+
+* **Energy**: measured using INA219 sensor
+
+  * Sampling frequency: ~100 Hz
+  * External stable power supply used
+* **Timing**:
+
+  * Microsecond precision via `esp_timer_get_time()`
+* **Network**:
+
+  * WiFi tests performed in stable indoor environment
+  * MQTT broker: HiveMQ (remote)
+
 
 #### Software
 The task design is implemented with the purpose to be completely modular, so every task has its own purpose. The communication between tasks is handled by queue, notification and global variables.
@@ -165,7 +187,7 @@ The adaptive sampling function is to make the system to save energy and avoid sa
 In order to achive a consistent energy saving I used the esp-idf + arduino framework in platformio.
 The result are satisfying:
 
-**adaptive sapling**
+**non adaptive sapling**
 
 ![current](./docs/current_non_adaptive_2-5Hz.png)
 
@@ -195,7 +217,7 @@ $\text{RTT} = (t_4 - t_1 ) - (t_3 - t_3)$
 
 The RTT is just a part of the latency, since a sampled is taken there are other things that influences the arrival of the message, the filter computing time and the window computing time. For this first part the filter is not present but the window computing time it is so we have a mean latency of:
 
-| frequency |	RTT (µs) |	window exec time (µs) |	total (µs) |
+| frequency |	RTT/2 (µs) |	window exec time (µs) |	total (µs) |
 | --  | -- | -- | -- | 
 |10 Hz |	121362.220000 |	6149756.660000 | 	6271118.880000|
 |500 Hz| 	115852.470000 |	124750.090000  |	240602.560000 |
@@ -255,11 +277,135 @@ The filters are implemented as a sliding window centered in the sample that is e
 #### Performance impact 
 ##### Energy
 We can see that the worst impact the add of the filter is on the adaptive sampling frequency.
+**average current consumption for all filter configuration**
 |label| 	mean current (mA)|
 | -- | -- |
 |500Hz |	142.9655             |
 |10Hz| 	98.1486          |
 
+**current consumption for different filter and windowsize**
+
+![current consuption window and filter](./docs/curr_cons_filter_window.png)
+
+Here we can clearly see that the most expensive filter from current perspective is the hampel one, this is justified from its complexity since it is necessary to calculate the median absolute deviation.
+
+##### Filter computing time
+We can easily visualize the computing time of a filter in relation to the window size, this allow us to understan exactly why the energy consuption is different from one to another.
+
+![filter exec time](./docs/filter_exec_time.png)
+
+Clearly this would lead us to think that reducing the window size is the optimal solution but we need to verify wheter the accuracy of the filter is degrading. 
+
+![tpr fpr window size](./docs/filter_tpr_fpr.png)
+
+We can clearly see that the two performance follows different pattern, the fpr decreases as the window size increase for both as the most data means the possibility to evaluate better. The tpr does not increase but instead decrease, probably simptom of the gaussian component of the noise and since the signal is moving a greater window includes further value from the one evaluated. 
+
+##### Filter performance
+It is also interesting to understand how the spike probability probability influences the filter performance
+
+![filter per spike probability](./docs/filter_spike_probability.png)
+
+Here we notice som interesting things when the spike probability increase the hampel filter lower its tpr for two out of three window size while the hampel filter incerase for the medium and large window size but decreases for the lower one. The hampel filter clearly shows its dependency from the average value while the hampel filter is shown more robust when the window is large enough. 
+##### Latency
+The end to end latency is influenced by the filter execution time. As we've seen before we have the following formula to calculate end to end latency:
+$$\text{latency} = RTT/2 + \text{filter computingtime} + \text{window computing time}$$
+
+**execution time in relation to latency**
+
+![](./docs/filter_exec_time_perc.png)
+
+We can see how much is insignificant from the point o view of end to end latency since a tumbling window is involved and since I used an external broker which increased latency too.
+
+## Use of LLM
+
+### Prompts Used
+
+Examples of prompts used during development:
+
+* "Implement a FreeRTOS task for periodic ADC sampling on ESP32"
+* "How to compute FFT using arduinoFFT library"
+* "Implement Z-score anomaly detection in C++ with sliding window"
+* "Compare Hampel filter vs Z-score in embedded systems"
+
+### Generated Components
+
+The LLM assisted in:
+
+* Initial structure of FreeRTOS tasks
+* FFT usage examples
+* Basic filter implementations
+
+### Evaluation of Code Quality
+
+* Generated code was **syntactically correct**
+* Required **manual optimization** for:
+
+  * Memory usage
+  * Real-time constraints
+  * Integration with queues and interrupts
+
+### Limitations
+
+* LLM does not consider **real-time constraints**
+* Suggested implementations were sometimes:
+
+  * Inefficient (e.g., unnecessary copies)
+  * Not hardware-aware
+* Required **manual debugging and validation**
+
+### Conclusion
+
+The LLM was useful as a **development accelerator**, but not sufficient without strong domain knowledge and manual refinement.
+
+## Reproducibility Guide
+
+### Hardware Setup
+
+* ESP32 Heltec LoRa V3 (sampler)
+* ESP32 Wroom-32 (generator)
+* INA219 current sensor
+* External power supply
+
+### Steps
+
+1. **Flash Firmware**
+
+   * Use PlatformIO
+   * Upload generator and sampler code to respective boards
+
+2. **Configure WiFi**
+
+   * Set SSID and password in `secrets.h` 
+
+3. **MQTT Setup**
+
+   * Broker: HiveMQ
+   * Topic: `tzn/data`
+   * Run provided Python script to log data
+
+4. **TTN Setup**
+
+   * Register device on TTN
+   * Configure keys in `secrets.h`
+
+5. **Run System**
+
+   * Power both boards
+   * Hardware connection as in the hardware section
+   * Monitor output via serial_plotter.py or MQTT client
+
+6. **Data Analysis**
+
+   * Use provided Python scripts:
+    - `fft_plotter.py` to plot the fft dynamically during execution
+    - `server.py` to receive ansd store MQTT received data
+    - `serial_storer.py` to store data from the monitor
+    - data analysis using `analysis.py`
+
+### Notes
+
+* Ensure stable WiFi connection
+* Use same power supply for consistent energy measurements
 ## Appendix
 ### Appendix A Json Schema
 ```JSON
