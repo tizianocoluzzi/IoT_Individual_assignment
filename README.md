@@ -44,11 +44,10 @@ To achive the flexibilty I used a specific struct called profileRuntime that def
 
 * **Energy**: measured using INA219 sensor
 
-  * Sampling frequency: ~100 Hz
+  * Sampling frequency: ~200 Hz
   * External stable power supply used
 * **Timing**:
 
-  * Microsecond precision via `esp_timer_get_time()`
 * **Network**:
 
   * WiFi tests performed in stable indoor environment
@@ -66,10 +65,12 @@ When the fft task terminates its execution triggers the next test by changing th
 The system is composed of an ESP32 heltec LoRa V3 that act as a supervisor, a ESP32 Wroom-32 that act as signal generator and monitor, an Ina219 and an exteernal power source.
 ![circuit diagram](./docs/circuit_diagram.png)
 
-The two wires directly connectng the tow esp are: The signal wire which is connected beteen DAC of the generator and ADC of the sample. In the other direction there is a digital connection that enable the sampler to comunicate when a test is ended to the monitor. A pullup resistor is added to avoid interference in booting te sampler.
+The two wires directly connectng the tow esp are: The signal wire which is connected beteen DAC of the generator and ADC of the sample. In the other direction there is a digital connection that enable the sampler to comunicate when a test is ended to the monitor. A pullup resistor is added to avoid interference in booting the sampler.
 
 ## Computation
-Here is presented the computing part of the project
+Here is presented the computing part of the project.
+The chosen signal is the following:
+$$\sin(2\pi 2t) + 0.5\sin(2\pi5t)$$
 ### Maximum frequency
 The oversampling frequency is obtained using doing manual tuning using this code:
 ```C
@@ -317,24 +318,41 @@ $$\text{latency} = RTT/2 + \text{filter computingtime} + \text{window computing 
 We can see how much is insignificant from the point o view of end to end latency since a tumbling window is involved and since I used an external broker which increased latency too.
 
 ## Use of LLM
-
+In order to document the use of LLM I used different LLM to make a comparison of the result obtained.
+I can divide logically the task I assigned to the LLM:
+- implementation of new code
+- refactoring and reordering
+- debug
 ### Prompts Used
+I did not used structured prompt strategy, which should be the standard approach to obtain consistent result.
+Example of prompt used:
+**implementation of new code** for copilot:
+> implement an automatic switch between {oversampling/adapting sampling}, {no noise, noise, nose+filter} and different filter types and spike probability. Update the global variable that already define this behaviour and create new one for the things defined by compiler macro.
 
-Examples of prompts used during development:
+This is an example of accepted result with some problem, I did not specify the frequency of the automatic switch I had in mind, the code was already predisposed to be automatically switched sot the automatic switch task was well implemented by the LLM but the lack of indication made him to switch after a predefined period of time regardless of the FFT computing. Which would create inconsistency with the result. 
+The LLM also implemented the automatic switch task to busy wait for the number of collected sample to reach 1024 instead of using notification system.
+**debug**:
+> Check wheter some part of the code use unadapted sampling frequency (in particulare the constant FREQ)
 
-* "Implement a FreeRTOS task for periodic ADC sampling on ESP32"
-* "How to compute FFT using arduinoFFT library"
-* "Implement Z-score anomaly detection in C++ with sliding window"
-* "Compare Hampel filter vs Z-score in embedded systems"
+Since I started with compile time macros to switch from one state to another when I switched I wanted to be shure that there was no hardcoded macro in the code, since usually the LLM are great in reading words I used it to spot some variables left unchanged.
 
+**refactoring**:
+> divide the code into different file, define .cpp and .h files. Each code most include a task and all the relative function, do not touch the code except if for compiling purpose
+
+The aim of the prompt is clear and the result was pretty good. The code became more readable then before because of the logic division between files.
+
+Clearly other prompts' result were reverted because of:
+A) code quality
+B) completely off-topic
+C) too much changing in the codebase
+I do not have any track of the reverted changes, probably are automatically deleted by the copilot plugin in vscode.
 ### Generated Components
 
 The LLM assisted in:
 
-* Initial structure of FreeRTOS tasks
-* FFT usage examples
-* Basic filter implementations
-
+* structuring the tasks and the project
+* creating data analysis and visualization tools
+* comunication tasks
 ### Evaluation of Code Quality
 
 * Generated code was **syntactically correct**
@@ -344,18 +362,23 @@ The LLM assisted in:
   * Real-time constraints
   * Integration with queues and interrupts
 
+* Requuired **manual fixes** for:
+  * Algorithm correctness (e.g. filter sample not center but evaluated only in the past) 
+
 ### Limitations
 
-* LLM does not consider **real-time constraints**
-* Suggested implementations were sometimes:
-
-  * Inefficient (e.g., unnecessary copies)
-  * Not hardware-aware
-* Required **manual debugging and validation**
+The main limitations are:
+* **verbosity**: the generated code is always full of variables with long names and to do a simple operation generates more istruction then necessary reducing code redability
+* **context panic**: when the contex window became to large into a chat, e.g. when trying to solve an insidious bug, the chat model tends to give the same answers in loop resulting more a problem then a help.
 
 ### Conclusion
 
-The LLM was useful as a **development accelerator**, but not sufficient without strong domain knowledge and manual refinement.
+The LLM was useful as a **development accelerator**, instead of manually implement each line of code the LLM can do the most of the writing part and leave to the programmer the job to fine tune and correct eventual mistakes like bugs. Clearly this is possible wheter the programmer is fully conscius of the problem is trying to solve and of the capability of the tool he's using.
+I'm not so used to using LLM when I program embedded system so sometimes I felt overwhelmed by the amount of code it wrote for a prompt and i rejected it.
+Some little guidelines I'll try to follow from now on:
+- Give the model little tasks to implement instead of big piece of the codebase
+- Be more precise in the propts defining better the costraints
+- Define a precise style of coding to improve redability
 
 ## Reproducibility Guide
 
