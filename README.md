@@ -202,7 +202,7 @@ The RTT is just a part of the latency, since a sampled is taken there are other 
 
 ### Network traffic
 The network traffic is given by the following folrmula:
-$\text{traffic} = (\text{payload} + 2\text{MQTT overhead} + \text{response}) \times \frac{\text{sampling freq}{windowsize}$
+$\text{traffic} = (\text{payload} + 2\text{MQTT overhead} + \text{response}) \times \frac{\text{sampling freq}}{windowsize}$
 So it varies only based on the sampling frequency.
 
 **wireshark capture for payload size**
@@ -215,11 +215,55 @@ From this capture we can understand that an exchange of messages is about 520byt
 | 10 |  81  |
 | 500 | 4062.5  |
 
-Which is completely due to the proprtion fo the sampling freqeuncy.
+Which is completely due to the proprtion fo the sampling frequency.
+
+## Bonus section
+The bonus section is about showing the system to be reliable also for different types of signal than the chosen one.
+To evaluate how a noise impact the performance and how a filter may mitigate the problem derived from a noise.
+### Other signals
+As alternative signals I tried to vary the amplitude and the proximity of the sine waves. I chose:
+- $\sin(2 \pi 3t) + 0.15\sin(2 \pi 4t)$
+- $0.5\sin(2 \pi t) + 0.3\sin(2 \pi 10t)$
+The goal was to verify if decreasing the general amplitude the peak identifier may make mistakes or if inserting a small sinewave along a bigger one with max amplitude may lead to ignoring the small one.
+
+Both the signals are correctly identified as shown below:
+
+![3-4Hz peak](./docs/peakId_3-4Hz.png)
+![3-4Hz spectrum](./docs/spectrum_3-4Hz.png)
+![1-10Hz peak](./docs/peakId_1-10Hz.png)
+![1-10Hz spectrum](./docs/spectrum_1-10Hz.png)
+
+_note: the two images are not about the same moment since the tool used to create the plot of the FFT conflicts with the serial output so a small difference is visible_ 
+
+### Noise section
+The system is developed around the idea to analyze dinamycally the variation proposed by the assignment about the noise. I made to switch between 40 profiles to gather enough data in an aoutomatic and reproducible way.
+The profiles are:
+- {oversampling / no oversampling} x {no noise, noise} -> noise with fixed spiek probability at 0.05
+- {oversampling / no oversampling} x noise x {hampel, z-score} {peak probability} {window size}
+with peak probbaility as {0.01, 0.05, 0.10}
+and window size as {5, 15, 31}
+#### Noise addiction 
+To have the possibility to calculate TPR and FPR for the filter identifier I implemented the addiction of the noise from the sampler and not the generator. This is counterintuitive and clearly degradates the system performance but it is the noly way to obtain true data since: clock syncronization was not available and the sampling rate is different from the generation rate, this would have the effect to make impossible knowing with confidence if a sample was read or not and so is impossible to determine its state.
+
+##### Noise impact
+The noise addiction without adding the filter did not alter the FFT computation since the condition for identify peaks showed to be strong enough to resist outliers and zero mean gaussian noise.
+this implies that from the point of view of the network traffic nothing changed because the two frequency did not change.
+#### Filters
+The two chosen filters are: z-score and hampel filter, they work in a different way, hampel evaluate if a sample is an outlier using MAD (median absolute deviation) while z-score uses standard deviation.
+The filters are implemented as a sliding window centered in the sample that is evaluated.
+
+#### Performance impact 
+##### Energy
+We can see that the worst impact the add of the filter is on the adaptive sampling frequency.
+|label| 	mean current (mA)|
+| -- | -- |
+|500Hz |	142.9655             |
+|10Hz| 	98.1486          |
+
 ## Appendix
 ### Appendix A Json Schema
 ```JSON
-"{  
+{  
 "cnt":, //id
 "t1":,
 "mean":,
